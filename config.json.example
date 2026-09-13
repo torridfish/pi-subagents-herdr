@@ -1,0 +1,8 @@
+{
+  "backend": "auto",
+  "maxConcurrency": 4,
+  "masterRatio": 0.6,
+  "minPaneRows": 8,
+  "models": {},
+  "toolExtensions": {}
+}

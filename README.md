@@ -1,164 +1,133 @@
-# Minimal Subagents
+# pi-subagents-herdr
 
-A [pi](https://github.com/earendil-works/pi) extension that registers a single `subagent` tool with three agents:
+[amosblomqvist/pi-subagents](https://github.com/amosblomqvist/pi-subagents), extended with real [Herdr](https://herdr.dev) child panes and a **Hyprland-inspired master/stack layout**.
 
-| Agent | Tools | Model | Purpose |
-|-------|-------|-------|---------|
-| **scout** | read, grep, find, ls | claude-haiku-4-5 | Fast codebase recon |
-| **researcher** | web_search, web_fetch | claude-sonnet-4-6 | Web research |
-| **worker** | read, write, edit, safe_bash, web_search, web_fetch, subagent | claude-sonnet-4-6 | Code changes (can dispatch scout/researcher to protect its own context) |
+```text
+One child                 Three children
+┌──────────────┬─────────┐ ┌──────────────┬─────────┐
+│              │         │ │              │ scout   │
+│   main Pi    │  scout  │ │   main Pi    ├─────────┤
+│  master 60%  │         │ │  master 60%  │ worker  │
+│              │         │ │              ├─────────┤
+│              │         │ │              │ research│
+└──────────────┴─────────┘ └──────────────┴─────────┘
+```
 
-`worker` is allowlisted to spawn only `scout` and `researcher` (via `subagent_agents` in its frontmatter), so the chain stops at depth 2 — a worker cannot recurse into another worker.
+The first child splits **right** of the caller. Subsequent children append **down** in the stack; owned stack splits are rebalanced to equal heights. The master never becomes another shrinking stack pane. Child completion closes its pane and rebalances the remainder. The final child closing restores the original caller region.
 
-## Dependencies
+- Keeps upstream's `subagent({ agent, task, cwd? })`, streamed tool/usage display, `Ctrl+O`, isolated contexts, and per-process concurrency limit.
+- Real interactive Pi TUI in every child pane; structured event sidecars return results to the parent. No screen scraping or duplicate model runs.
+- **Task-scoped, synchronous tool semantics**: calls wait for results; multiple tool calls run concurrently. This is **not** the async notification/resume/planner system from `pi-herdr-subagents`.
+- Never focuses a child, creates another tab/workspace, or rearranges unrelated existing panes. A pre-existing multipane tab uses the caller's region, not the entire tab.
+- Nested worker → scout/researcher calls inherit a shared, cross-process-locked stack. They do not split their worker into miniature columns.
+- Parent cancellation/shutdown cleans up owned children. A runner heartbeat terminates a child after loss of its parent. Manual topology changes fail safely instead of rearranging unrelated panes.
+- Outside Herdr, `auto` uses upstream-style headless JSON subprocesses. A Herdr failure is reported, never silently rerun in a second backend.
 
-`safe_bash` ships in this repo (`tools/safe-bash.ts`). `web_search` and `web_fetch` do not — `researcher` and `worker` depend on them. Grab those two extensions from [amosblomqvist/pi-config](https://github.com/amosblomqvist/pi-config) (`extensions/web-search/`, `extensions/web-fetch/`) and drop them into `~/.pi/agent/extensions/`. Without them the affected agents will launch with an empty tool allowlist and silently do nothing useful.
+## Install
+
+Requires current Pi (`@earendil-works`, tested with **0.85.1**), Node **22+**, and Herdr with `layout.export` / `layout.set_split_ratio` (tested against API protocol **22**).
+
+```bash
+pi install git:github.com/torrid-fish/pi-subagents-herdr
+# Private repository: Git must already be authenticated.
+```
+
+Or install a development checkout without copying it:
+
+```bash
+pi install /absolute/path/to/pi-subagents-herdr
+```
+
+Run `/reload` in an existing Pi session, or restart Pi. Do not install another extension registering `subagent` alongside this one.
+
+Researcher/worker require **pi-web-access**, which supplies `web_search` and `fetch_content`:
+
+```bash
+pi install npm:pi-web-access
+```
+
+Loaded custom tools are resolved from Pi's `sourceInfo.path`, then passed explicitly to children with `--no-extensions` and a tool allowlist. No developer-specific extension paths are required. Missing declared tools cause an actionable error before launching.
 
 ## Usage
 
-One tool call = one subagent:
-```json
-{ "agent": "scout", "task": "Find all auth-related files in src/" }
-```
+Ask Pi to delegate, for example:
 
-To fan out, emit multiple `subagent` tool calls in the same assistant turn — pi runs them in parallel automatically. A per-process semaphore caps simultaneous subagents at `maxConcurrency` (default 4); calls past the cap wait their turn.
+> 用兩個 scout 同時探索 auth 與 database 模組，最後整合結果。
 
-Each subagent runs as an isolated `pi` process with no inherited context — all context must be in the task description.
-
-## Config
-
-Optional `config.json` next to `index.ts`:
+Tool call:
 
 ```json
-{ "maxConcurrency": 4 }
+{ "agent": "scout", "task": "Map the authentication module; report relevant file paths." }
 ```
 
-## Output
+| Agent | Purpose | Allowed tools |
+|---|---|---|
+| scout | Codebase exploration | read, grep, find, ls |
+| researcher | Sourced web research | web_search, fetch_content |
+| worker | Isolated implementation | read, write, edit, safe_bash, web_search, fetch_content, subagent |
 
-Subagents return text only — there's no file handoff. If the parent needs artifacts, instruct the subagent to `write` them and return the path.
+Worker may spawn only scout/researcher. They cannot delegate further. Include all task context explicitly; conversation history is not copied.
 
-Large outputs (>`DEFAULT_MAX_BYTES`) are head-truncated before being returned to the parent.
+Child Pi sessions automatically exit when the task settles; these are not persistent handoff/resume sessions. Results and live progress remain in the parent's tool transcript. `safe_bash` is a heuristic command filter, **not a security sandbox**; workers have normal file access.
 
-## UI
+## Configuration
 
-Two levels, toggled with `ctrl+o`:
+Copy `config.json.example` to `config.json` beside `index.ts` (gitignored):
 
-- **Collapsed (default):** the tool call shows one line — `subagent <agent> <60-char task preview>`. The result block shows the agent header (status, tool count, duration), the chronological tool log (one line per call, running calls marked with `▸`), the latest prose "thinking" line, and a usage line (tokens in/out, cache, cost, context-window gauge).
-- **Expanded:** the call header streams the full task body live as the parent writes it (like `write`/`edit`). The result block additionally renders the subagent's full final output as markdown. Nested children (when a worker spawns scout/researcher) render inline, indented under the row that dispatched them, with their own per-row context gauge.
-
-## Registering Agents from Other Extensions
-
-Other extensions can dynamically register and unregister agents at runtime. This is useful for domain-specific agents that should only be available when a particular extension is active.
-
-### 1. Define agent `.md` files
-
-Create markdown files with YAML frontmatter in your extension's directory (e.g. `my-extension/agents/my-agent.md`):
-
-```markdown
----
-name: my-agent
-description: Does a specific thing
-tools: web_search, video_extract
-model: claude-sonnet-4-20250514
----
-
-You are an agent that does a specific thing...
-```
-
-Frontmatter fields:
-- **name** (required) — unique agent name, used in `{ agent: "my-agent" }` calls
-- **description** — short description
-- **tools** — comma-separated list of tools the agent needs (builtin or extension). Include `subagent` here to let this agent spawn other agents.
-- **model** — model identifier (defaults to `anthropic/claude-sonnet-4-6`)
-- **thinking** — reasoning level: `off`, `low`, `medium`, `high` (defaults to `medium`)
-- **subagent_agents** — if `subagent` is in `tools`, restrict which agents this one may spawn. Comma-separated list of agent names. Omit for no restriction. Enforced by passing `PI_SUBAGENT_ALLOWED` env to the child `pi` process — the child's subagents extension filters its registry before any tool description sees it, so the child LLM literally can't reference an agent outside the allowlist.
-
-The markdown body becomes the agent's system prompt.
-
-### 2. Register agents via `globalThis.__pi_subagents`
-
-Pi loads extensions via jiti, which creates separate module instances. Direct imports from the subagents extension will reference a different `agents` array than the one the `subagent` tool uses. Use the `globalThis` bridge instead:
-
-```typescript
-import { parseFrontmatter } from "@earendil-works/pi-coding-agent";
-import * as fs from "node:fs";
-import * as path from "node:path";
-
-interface AgentConfig {
-  name: string;
-  description: string;
-  tools: string[];
-  model: string;
-  thinking: string;        // "off" | "low" | "medium" | "high"
-  systemPrompt: string;
-  filePath: string;
-  subagentAgents?: string[]; // optional spawn-allowlist when `subagent` is in tools
-}
-
-const AGENTS_DIR = path.join(path.dirname(new URL(import.meta.url).pathname), "agents");
-
-function registerMyAgents(): void {
-  const subagents = (globalThis as any).__pi_subagents as
-    | { registerAgent: (config: AgentConfig) => void; unregisterAgent: (name: string) => void }
-    | undefined;
-  if (!subagents) return; // subagents extension not loaded
-
-  for (const entry of fs.readdirSync(AGENTS_DIR)) {
-    if (!entry.endsWith(".md")) continue;
-    const filePath = path.join(AGENTS_DIR, entry);
-    const content = fs.readFileSync(filePath, "utf-8");
-    const { frontmatter, body } = parseFrontmatter<Record<string, string>>(content);
-    if (!frontmatter.name) continue;
-
-    const tools = (frontmatter.tools || "").split(",").map(t => t.trim()).filter(Boolean);
-    const subagentAgents = frontmatter.subagent_agents
-      ? frontmatter.subagent_agents.split(",").map(t => t.trim()).filter(Boolean)
-      : undefined;
-    try {
-      subagents.registerAgent({
-        name: frontmatter.name,
-        description: frontmatter.description || "",
-        tools,
-        model: frontmatter.model || "anthropic/claude-sonnet-4-6",
-        thinking: frontmatter.thinking || "medium",
-        systemPrompt: body,
-        filePath,
-        ...(subagentAgents ? { subagentAgents } : {}),
-      });
-    } catch {
-      // Already registered — skip
-    }
-  }
+```json
+{
+  "backend": "auto",
+  "maxConcurrency": 4,
+  "masterRatio": 0.6,
+  "minPaneRows": 8,
+  "models": {},
+  "toolExtensions": {}
 }
 ```
 
-Call `registerMyAgents()` when your extension activates (e.g. in a command handler). The agents become available to the `subagent` tool immediately.
+- `backend`: `auto`, `herdr`, or `process`.
+- `masterRatio`: left/master share, 0.2–0.8. Only applied when opening the first child.
+- `maxConcurrency`: positive integer, per parent process, default 4.
+- `minPaneRows`: minimum rows per child, default 8. If the shared stack is full, the next call fails with a capacity message rather than creating an unreadable pane. Nested agents count toward this geometry limit, but have their own execution semaphore.
+- `models`: agent name → exact `provider/model-id`; `default` is an optional fallback. Precedence: per-agent config → default config → agent frontmatter → parent model. Bundled agents inherit the parent's current model; no Anthropic credentials are assumed.
+- `toolExtensions`: optional tool name → absolute extension file path; overrides automatic discovery.
 
-### 3. Adding custom tool support
+Session-only backend selection:
 
-If your agents need tools beyond the built-in set, those tools must be mapped in the `CUSTOM_TOOL_EXTENSIONS` record in `subagents/index.ts`:
-
-```typescript
-const CUSTOM_TOOL_EXTENSIONS: Record<string, string> = {
-  web_search: path.join(EXT_BASE, "web-search", "index.ts"),
-  web_fetch: path.join(EXT_BASE, "web-fetch", "index.ts"),
-  safe_bash: path.join(TOOLS_DIR, "safe-bash.ts"),
-  video_extract: path.join(EXT_BASE, "video-extract", "index.ts"),
-  youtube_search: path.join(EXT_BASE, "youtube-search", "index.ts"),
-  google_image_search: path.join(EXT_BASE, "google-image-search", "index.ts"),
-};
+```text
+/subagents-herdr status
+/subagents-herdr herdr
+/subagents-herdr process
+/subagents-herdr auto
 ```
 
-Built-in tools (`read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`) work automatically. Any other tool the agent lists in its frontmatter must have a corresponding entry here pointing to the extension's `index.ts`.
+The command selects the transport; it does not launch a new Herdr server. Start Pi inside Herdr to use pane mode.
 
-The `subagent` tool itself is listed in `CUSTOM_TOOL_EXTENSIONS` pointing back to this extension's own `index.ts` — that's how an agent like `worker` can recursively spawn other agents. Recursion is bounded only by each agent's `subagent_agents` allowlist (e.g. worker can spawn scout/researcher, neither of which declares the `subagent` tool, so the chain stops at depth 2).
+Custom agent registration retains upstream's `globalThis.__pi_subagents` bridge; see [upstream documentation](docs/UPSTREAM-README.md#registering-agents-from-other-extensions). Its old hardcoded web-tool installation and model defaults are superseded by the settings above. This fork does not add project-local agent discovery.
 
-## Structure
+## Development and verification
 
+```bash
+npm install
+npm test
+npm run typecheck
+
+# Explicit opt-in: briefly creates four panes in the calling tab, then cleans up.
+npx tsx test/live-layout.ts
+
+# Explicit opt-in: invokes a real model using your existing Pi credentials.
+PI_TEST_MODEL=provider/model-id npx tsx test/live-agent.ts
+
+# Also exercise worker → two parallel scouts in the same stack:
+PI_TEST_MODEL=provider/model-id PI_TEST_NESTED=1 \
+  PI_TEST_WEB_EXTENSION=/absolute/path/to/pi-web-access/index.ts \
+  npx tsx test/live-agent.ts
 ```
-subagents/
-├── index.ts           # Extension entry point
-├── agents/            # Built-in agent configs (frontmatter + system prompt)
-└── tools/             # Extensions loaded into subagent processes
-    └── safe-bash.ts   # bash with dangerous command blocking
-```
+
+The live layout test checks four equal-height children, preserved focus, and rebalancing after middle-pane removal. The live agent test checks actual interactive Pi startup, event bridging, final output, and cleanup. Unit tests cover ownership boundaries, cross-process-manager serialization, capacity, argument conversion, and shell quoting.
+
+Herdr configuration and server versions are never modified. API calls are bounded by a timeout. Temporary task/event/environment files are private (directory 0700, files 0600) and removed after completion. Abrupt parent death can leave its temporary files and shell pane behind; the heartbeat stops the child process, but does not delete state owned by a dead parent.
+
+## Provenance
+
+Based directly on upstream history at `1f541897588b995144f0bb8e71a335d1c85b1e62`. Herdr execution UX was informed by [0xRichardH/pi-herdr-subagents](https://github.com/0xRichardH/pi-herdr-subagents), while layout and transport code here are newly implemented. See [PROVENANCE.md](PROVENANCE.md) before redistribution: the base repository supplied no LICENSE, so this repository is private and is not represented as MIT-licensed.
