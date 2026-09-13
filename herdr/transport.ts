@@ -1,0 +1,102 @@
+import * as fs from "node:fs/promises";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+import * as path from "node:path";
+import { fileURLToPath } from "node:url";
+import { setTimeout as delay } from "node:timers/promises";
+import { MasterLayout, request } from "./layout.ts";
+
+export interface PaneLaunch {
+  command: string; args: string[]; cwd: string; env: NodeJS.ProcessEnv;
+  directory: string; name: string; signal?: AbortSignal;
+  onLine: (line: string) => void;
+}
+const here = path.dirname(fileURLToPath(import.meta.url));
+export function shellQuote(value: string): string { return "'" + value.replaceAll("'", "'\\''") + "'"; }
+export function interactiveArgs(args: string[]): string[] {
+  const result: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === "--mode") { i++; continue; }
+    if (args[i] === "-p") continue;
+    result.push(args[i]);
+  }
+  // Options must precede task; Pi also accepts these following its positional prompt.
+  return ["--extension", path.join(here, "child.ts"), ...result];
+}
+
+export async function runInPane(layout: MasterLayout, spec: PaneLaunch): Promise<{ code: number; error?: string }> {
+  spec.signal?.throwIfAborted();
+  // Keep Node's entrypoint before Pi flags.
+  const entry = spec.args[0]?.match(/\.(?:mjs|cjs|js)$/) ? spec.args.slice(0, 1) : [];
+  const args = [...entry, ...interactiveArgs(spec.args.slice(entry.length))];
+  await fs.writeFile(path.join(spec.directory, "launch.json"), JSON.stringify({
+    command: spec.command, args, cwd: spec.cwd, env: spec.env,
+  }), { mode: 0o600 });
+  await fs.writeFile(path.join(spec.directory, "heartbeat"), "", { mode: 0o600 });
+  await fs.writeFile(path.join(spec.directory, "events.jsonl"), "", { mode: 0o600 });
+  const pane = await layout.create(spec.name, spec.cwd);
+  let offset = 0, pending = "", ready = false, complete = false;
+  let cancelledAt = 0;
+  const start = Date.now();
+  const cancel = () => { cancelledAt ||= Date.now(); void fs.writeFile(path.join(spec.directory, "cancel"), "", { mode: 0o600 }).catch(() => {}); };
+  spec.signal?.addEventListener("abort", cancel, { once: true });
+  const readEvents = async () => {
+    const file = await fs.open(path.join(spec.directory, "events.jsonl"), "r");
+    try {
+      const buffer = Buffer.alloc(64 * 1024);
+      while (true) {
+        const { bytesRead } = await file.read(buffer, 0, buffer.length, offset);
+        if (!bytesRead) break;
+        offset += bytesRead;
+        // Preserve split UTF-8 characters by buffering bytes until newline.
+        bytes = Buffer.concat([bytes, buffer.subarray(0, bytesRead)]);
+        let end: number;
+        while ((end = bytes.indexOf(10)) >= 0) {
+          pending = bytes.subarray(0, end).toString("utf8"); bytes = bytes.subarray(end + 1);
+          const event = JSON.parse(pending);
+          if (event.type === "bridge_ready") ready = true;
+          if (event.type === "bridge_complete") complete = true;
+          spec.onLine(pending);
+        }
+      }
+    } finally { await file.close(); }
+  };
+  let bytes: Buffer = Buffer.alloc(0);
+  try {
+    // Wait for the actual shell foreground process, rather than sending into shell startup.
+    while (true) {
+      spec.signal?.throwIfAborted();
+      const { process_info: info } = await request("pane.process_info", { pane_id: pane });
+      if (info.foreground_processes?.some((p: any) => p.pid === info.shell_pid)) break;
+      if (Date.now() - start > 15000) throw new Error("Child shell did not become ready");
+      await delay(100);
+    }
+    await delay(300);
+    spec.signal?.throwIfAborted();
+    const command = [process.execPath, path.join(here, "runner.mjs"), spec.directory].map(shellQuote).join(" ");
+    await promisify(execFile)(process.env.HERDR_BIN_PATH || "herdr", ["pane", "run", pane, command], { timeout: 10000 });
+    let lastInspection = 0;
+    while (true) {
+      await readEvents();
+      try {
+        const exit = JSON.parse(await fs.readFile(path.join(spec.directory, "exit.json"), "utf8"));
+        await readEvents();
+        if (exit.code === 0 && !complete) return { code: 1, error: "Child exited before completing its task" };
+        return exit;
+      } catch (error: any) { if (error.code !== "ENOENT") throw error; }
+      if (!ready && Date.now() - start > 60000) throw new Error("Child Pi did not start within 60 seconds");
+      if (spec.signal?.aborted) cancel();
+      if (cancelledAt && Date.now() - cancelledAt > 8000) throw new Error("Subagent cancelled");
+      if (Date.now() - lastInspection > 2000) {
+        await request("pane.get", { pane_id: pane });
+        lastInspection = Date.now();
+      }
+      await fs.utimes(path.join(spec.directory, "heartbeat"), new Date(), new Date());
+      await delay(100);
+    }
+  } finally {
+    spec.signal?.removeEventListener("abort", cancel);
+    // Closing only an owned pane also terminates a failed/stalled launch.
+    await layout.release(pane);
+  }
+}
