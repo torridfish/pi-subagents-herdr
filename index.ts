@@ -5,13 +5,16 @@
  * Supports single and parallel execution. Output is verbal only (no file handoff).
  */
 import { spawn } from "node:child_process";
+import { fileURLToPath } from "node:url";
+import { MasterLayout } from "./herdr/layout.ts";
+import { runInPane } from "./herdr/transport.ts";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
-import { getMarkdownTheme, parseFrontmatter, truncateHead, withFileMutationQueue, DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES } from "@mariozechner/pi-coding-agent";
-import { Container, Markdown, Spacer, Text, visibleWidth } from "@mariozechner/pi-tui";
-import { Type } from "@sinclair/typebox";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { getMarkdownTheme, parseFrontmatter, truncateHead, withFileMutationQueue, DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES } from "@earendil-works/pi-coding-agent";
+import { Container, Markdown, Spacer, Text, visibleWidth } from "@earendil-works/pi-tui";
+import { Type } from "typebox";
 
 // ── Types ──────────────────────────────────────────────────────────────
 
@@ -90,9 +93,14 @@ interface Details {
 
 interface ExtensionConfig {
 	maxConcurrency?: number;
+	backend?: "auto" | "herdr" | "process";
+	masterRatio?: number;
+	minPaneRows?: number;
+	models?: Record<string, string>;
+	toolExtensions?: Record<string, string>;
 }
 
-const EXT_DIR = path.dirname(new URL(import.meta.url).pathname);
+const EXT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const AGENTS_DIR = path.join(EXT_DIR, "agents");
 const TOOLS_DIR = path.join(EXT_DIR, "tools");
 const CONFIG_PATH = path.join(EXT_DIR, "config.json");
@@ -101,9 +109,11 @@ const DEFAULT_MAX_CONCURRENCY = 4;
 function loadConfig(): ExtensionConfig {
 	try {
 		if (fs.existsSync(CONFIG_PATH)) {
-			return JSON.parse(fs.readFileSync(CONFIG_PATH, "utf-8")) as ExtensionConfig;
+			const parsed = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf-8"));
+			if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("Expected a JSON object");
+			return parsed as ExtensionConfig;
 		}
-	} catch {}
+	} catch (error) { throw new Error(`Invalid ${CONFIG_PATH}: ${error}`); }
 	return {};
 }
 
@@ -135,9 +145,8 @@ let agents: AgentConfig[] = [];
 // later by a third-party extension) that isn't in the list.
 const SUBAGENT_ALLOWLIST: string[] | undefined = (() => {
 	const raw = process.env.PI_SUBAGENT_ALLOWED;
-	if (!raw) return undefined;
-	const list = raw.split(",").map((s) => s.trim()).filter(Boolean);
-	return list.length > 0 ? list : undefined;
+	if (raw === undefined) return undefined;
+	return raw.split(",").map((s) => s.trim()).filter(Boolean);
 })();
 
 export function registerAgent(config: AgentConfig): void {
@@ -177,7 +186,7 @@ function loadAgents(): AgentConfig[] {
 			name: frontmatter.name,
 			description: frontmatter.description || "",
 			tools,
-			model: frontmatter.model || "anthropic/claude-sonnet-4-6",
+			model: frontmatter.model || "",
 			thinking: frontmatter.thinking || "medium",
 			systemPrompt: body,
 			filePath,
@@ -288,11 +297,16 @@ async function buildPiArgs(
 	task: string,
 	cwd: string,
 ): Promise<{ args: string[]; tempDir: string; childEnv: NodeJS.ProcessEnv | undefined }> {
+	for (const tool of agent.tools) {
+		if (!BUILTIN_TOOLS.has(tool) && (!CUSTOM_TOOL_EXTENSIONS[tool] || !fs.existsSync(CUSTOM_TOOL_EXTENSIONS[tool]))) {
+			throw new Error(`Agent ${agent.name} requires unavailable tool ${tool}; install its extension or configure toolExtensions`);
+		}
+	}
 	const piBin = resolvePiBinary();
 	const tempDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-sub-"));
 
 	// Write system prompt to temp file
-	const promptPath = path.join(tempDir, `${agent.name}.md`);
+	const promptPath = path.join(tempDir, "system.md");
 	await withFileMutationQueue(promptPath, async () => {
 		await fs.promises.writeFile(promptPath, agent.systemPrompt, { encoding: "utf-8", mode: 0o600 });
 	});
@@ -328,7 +342,7 @@ async function buildPiArgs(
 		args.push("--extension", extPath);
 	}
 
-	args.push("--models", agent.model);
+	args.push("--model", agent.model);
 	args.push("--thinking", agent.thinking);
 	args.push("--append-system-prompt", promptPath);
 
@@ -350,7 +364,7 @@ async function buildPiArgs(
 	// to the LLM — so the child literally cannot request an agent outside the
 	// allowlist (the name isn't in its prompt).
 	let childEnv: NodeJS.ProcessEnv | undefined;
-	if (agent.tools.includes("subagent") && agent.subagentAgents && agent.subagentAgents.length > 0) {
+	if (agent.tools.includes("subagent") && agent.subagentAgents !== undefined) {
 		childEnv = { ...process.env, PI_SUBAGENT_ALLOWED: agent.subagentAgents.join(",") };
 	}
 
@@ -406,7 +420,9 @@ async function runSubagent(
 	cwd: string,
 	signal: AbortSignal | undefined,
 	onUpdate?: (progress: AgentProgress, usage: AgentResult["usage"]) => void,
+	layout?: MasterLayout,
 ): Promise<AgentResult> {
+	signal?.throwIfAborted();
 	const { args, tempDir, childEnv } = await buildPiArgs(agent, task, cwd);
 	const command = args[0];
 	const spawnArgs = args.slice(1);
@@ -438,13 +454,9 @@ async function runSubagent(
 		onUpdate?.(progress, result.usage);
 	}, 150);
 
-	const exitCode = await new Promise<number>((resolve) => {
-		const proc = spawn(command, spawnArgs, {
-			cwd,
-			stdio: ["ignore", "pipe", "pipe"],
-			...(childEnv ? { env: childEnv } : {}),
-		});
-
+	let exitCode = 1;
+	try {
+		exitCode = await new Promise<number>((resolve) => {
 		let buf = "";
 		let stderrBuf = "";
 
@@ -525,6 +537,7 @@ async function runSubagent(
 						}
 						if (evt.message.model) result.model = evt.message.model;
 						if (evt.message.errorMessage) progress.error = evt.message.errorMessage;
+						if (evt.message.stopReason === "aborted" || evt.message.stopReason === "error") progress.error ||= `Child ${evt.message.stopReason}`;
 
 						const text = extractTextFromContent(evt.message.content);
 						if (text) {
@@ -554,6 +567,26 @@ async function runSubagent(
 			}
 		};
 
+		if (layout) {
+			const env = { ...(childEnv ?? process.env), PI_SUBAGENT_LAYOUT_DIR: layout.directory,
+				PI_SUBAGENT_MASTER: layout.master, PI_SUBAGENT_BACKEND: "herdr",
+				PI_SUBAGENT_TOOL_EXTENSIONS: JSON.stringify(CUSTOM_TOOL_EXTENSIONS) };
+			void runInPane(layout, { command, args: spawnArgs, cwd, env, directory: tempDir,
+				name: agent.name, signal, onLine: processLine }).then(exit => {
+				if (exit.error) progress.error = exit.error;
+				resolve(exit.code);
+			}, error => { progress.error = String(error); resolve(1); });
+			return;
+		}
+		const proc = spawn(command, spawnArgs, { cwd, stdio: ["ignore", "pipe", "pipe"],
+			env: { ...(childEnv ?? process.env), PI_SUBAGENT_BACKEND: "process", PI_SUBAGENT_TOOL_EXTENSIONS: JSON.stringify(CUSTOM_TOOL_EXTENSIONS) } });
+		let closed = false;
+		let killTimer: ReturnType<typeof setTimeout> | undefined;
+		const kill = () => {
+			progress.error = "Subagent cancelled";
+			proc.kill("SIGTERM");
+			killTimer = setTimeout(() => { if (!closed) proc.kill("SIGKILL"); }, 3000);
+		};
 		proc.stdout.on("data", (d: Buffer) => {
 			buf += d.toString();
 			const lines = buf.split("\n");
@@ -566,6 +599,9 @@ async function runSubagent(
 		});
 
 		proc.on("close", (code) => {
+			closed = true;
+			clearTimeout(killTimer);
+			signal?.removeEventListener("abort", kill);
 			if (buf.trim()) processLine(buf);
 			if (code !== 0 && stderrBuf.trim() && !progress.error) {
 				progress.error = stderrBuf.trim();
@@ -573,22 +609,14 @@ async function runSubagent(
 			resolve(code ?? 1);
 		});
 
-		proc.on("error", () => resolve(1));
+		proc.on("error", error => { progress.error = error.message; resolve(1); });
 
-		if (signal) {
-			const kill = () => {
-				proc.kill("SIGTERM");
-				setTimeout(() => !proc.killed && proc.kill("SIGKILL"), 3000);
-			};
-			if (signal.aborted) kill();
-			else signal.addEventListener("abort", kill, { once: true });
-		}
-	});
-
-	// Cleanup temp dir
-	try {
+		if (signal?.aborted) kill();
+		else signal?.addEventListener("abort", kill, { once: true });
+		});
+	} finally {
 		fs.rmSync(tempDir, { recursive: true, force: true });
-	} catch {}
+	}
 
 	result.exitCode = exitCode;
 	progress.status = exitCode === 0 && !progress.error ? "completed" : "failed";
@@ -596,7 +624,7 @@ async function runSubagent(
 	if (progress.error) result.output = result.output || `Error: ${progress.error}`;
 
 	// Truncate output if very large
-	if (result.output.length > DEFAULT_MAX_BYTES) {
+	if (Buffer.byteLength(result.output) > DEFAULT_MAX_BYTES || result.output.split("\n").length > DEFAULT_MAX_LINES) {
 		const trunc = truncateHead(result.output, { maxLines: DEFAULT_MAX_LINES, maxBytes: DEFAULT_MAX_BYTES });
 		result.output = trunc.content;
 		if (trunc.truncated) {
@@ -797,7 +825,32 @@ function renderAgentProgress(
 
 export default function (pi: ExtensionAPI) {
 	const config = loadConfig();
-	const semaphore = new Semaphore(config.maxConcurrency ?? DEFAULT_MAX_CONCURRENCY);
+	const concurrency = config.maxConcurrency ?? DEFAULT_MAX_CONCURRENCY;
+	if (!Number.isInteger(concurrency) || concurrency < 1) throw new Error("maxConcurrency must be a positive integer");
+	if (config.masterRatio !== undefined && (!Number.isFinite(config.masterRatio) || config.masterRatio < 0.2 || config.masterRatio > 0.8)) throw new Error("masterRatio must be between 0.2 and 0.8");
+	if (config.minPaneRows !== undefined && (!Number.isInteger(config.minPaneRows) || config.minPaneRows < 3)) throw new Error("minPaneRows must be an integer >= 3");
+	const semaphore = new Semaphore(concurrency);
+	let backend = (process.env.PI_SUBAGENT_BACKEND ?? config.backend ?? "auto") as "auto" | "herdr" | "process";
+	if (!["auto", "herdr", "process"].includes(backend)) throw new Error("Invalid subagent backend");
+	let layout: MasterLayout | undefined;
+	let ownedLayoutDir: string | undefined;
+	const shutdown = new AbortController();
+	const running = new Set<Promise<AgentResult>>();
+	Object.assign(CUSTOM_TOOL_EXTENSIONS, JSON.parse(process.env.PI_SUBAGENT_TOOL_EXTENSIONS || "{}"), config.toolExtensions);
+	pi.on("session_shutdown", async () => {
+		shutdown.abort();
+		await Promise.allSettled([...running]);
+		if (ownedLayoutDir) fs.rmSync(ownedLayoutDir, { recursive: true, force: true });
+	});
+	pi.registerCommand("subagents-herdr", {
+		description: "Subagent backend: auto, herdr, process, or status",
+		handler: async (args, ctx) => {
+			const value = args.trim();
+			if (["auto", "herdr", "process"].includes(value)) backend = value as typeof backend;
+			else if (value && value !== "status") { ctx.ui.notify("Usage: /subagents-herdr [auto|herdr|process|status]", "warning"); return; }
+			ctx.ui.notify(`Subagents: ${backend}; master-left ${Math.round((config.masterRatio ?? 0.6) * 100)}%; stack-right; ${concurrency} concurrent`, "info");
+		},
+	});
 	agents = loadAgents();
 
 	// If spawned as a child by a parent subagent process, PI_SUBAGENT_ALLOWED
@@ -833,13 +886,26 @@ export default function (pi: ExtensionAPI) {
 				throw new Error("`subagent` requires both `agent` and `task`. To fan out work, emit multiple `subagent` tool calls in the same turn — they run in parallel.");
 			}
 
-			const agent = agents.find((a) => a.name === params.agent);
+			const definition = agents.find((a) => a.name === params.agent);
+			const agent = definition ? { ...definition, model: config.models?.[definition.name] ?? config.models?.default ?? (definition.model || (ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "")) } : undefined;
 			if (!agent) {
 				const available = agents.map((a) => a.name).join(", ") || "none";
 				throw new Error(`Unknown agent: ${params.agent}. Available agents: ${available}`);
 			}
 
-			const [provider, modelId] = (agent.model || "").split("/");
+			for (const tool of pi.getAllTools()) {
+				if (tool.sourceInfo.source !== "builtin" && fs.existsSync(tool.sourceInfo.path)) CUSTOM_TOOL_EXTENSIONS[tool.name] = tool.sourceInfo.path;
+			}
+			Object.assign(CUSTOM_TOOL_EXTENSIONS, config.toolExtensions);
+			const useHerdr = backend === "herdr" || (backend === "auto" && process.env.HERDR_ENV === "1");
+			if (useHerdr && !layout) {
+				if (process.env.HERDR_ENV !== "1" || !process.env.HERDR_PANE_ID) throw new Error("Run Pi inside Herdr or select /subagents-herdr process");
+				const directory = process.env.PI_SUBAGENT_LAYOUT_DIR ?? (ownedLayoutDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-master-")));
+				layout = new MasterLayout(directory, process.env.PI_SUBAGENT_MASTER ?? process.env.HERDR_PANE_ID, config.masterRatio ?? 0.6, config.minPaneRows ?? 8);
+			}
+			const effectiveSignal = signal ? AbortSignal.any([signal, shutdown.signal]) : shutdown.signal;
+			const slash = agent.model.indexOf("/");
+			const provider = agent.model.slice(0, slash), modelId = agent.model.slice(slash + 1);
 			const contextWindow = provider && modelId ? ctx.modelRegistry.find(provider, modelId)?.contextWindow : undefined;
 			const liveResult: AgentResult = {
 				agent: params.agent,
@@ -852,19 +918,23 @@ export default function (pi: ExtensionAPI) {
 				progress: { agent: params.agent, status: "running" as const, task: params.task, recentTools: [], toolCount: 0, tokens: 0, durationMs: 0, lastMessage: "" },
 			};
 
-			const result = await semaphore.run(() =>
-				runSubagent(agent, params.task!, params.cwd ?? cwd, signal, (progress, usage) => {
+			const work = semaphore.run(() =>
+				runSubagent(agent, params.task!, path.resolve(cwd, params.cwd ?? cwd), effectiveSignal, (progress, usage) => {
 					liveResult.progress = progress;
 					liveResult.usage = { ...usage };
 					onUpdate?.({
 						content: [{ type: "text", text: "(running...)" }],
 						details: { results: [liveResult] },
 					});
-				}),
+				}, useHerdr ? layout : undefined),
 			);
+			running.add(work);
+			let result: AgentResult;
+			try { result = await work; } finally { running.delete(work); }
 
 			result.contextWindow = contextWindow;
 			const isError = result.exitCode !== 0 || !!result.progress.error;
+			if (isError) throw new Error(result.progress.error || result.output || `Subagent exited ${result.exitCode}`);
 			return {
 				content: [{ type: "text", text: result.output || "(no output)" }],
 				details: { results: [result] },
