@@ -14,6 +14,8 @@ import * as path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { getMarkdownTheme, parseFrontmatter, truncateHead, withFileMutationQueue, DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES } from "@earendil-works/pi-coding-agent";
 import { type Component, Container, Markdown, Spacer, Text, visibleWidth } from "@earendil-works/pi-tui";
+import { buildClaudeArgs, makeClaudeLineHandler, type ClaudeRunnerConfig } from "./runners/claude.ts";
+import { extractToolArgsPreview, isRunner, proseSummary, RUNNERS, type RunnerArgs, type RunnerName } from "./runners/shared.ts";
 import { Type } from "typebox";
 
 // ── Types ──────────────────────────────────────────────────────────────
@@ -33,9 +35,15 @@ export interface AgentConfig {
 	 * `undefined` means no restriction (child sees every registered agent).
 	 */
 	subagentAgents?: string[];
+	/**
+	 * Which child process executes this agent: `pi` (default) or `claude`.
+	 * Set per agent in frontmatter, overridden by the `runners` config block.
+	 * The claude runner is process-backend only — see `runners/claude.ts`.
+	 */
+	runner?: RunnerName;
 }
 
-interface ToolEvent {
+export interface ToolEvent {
 	tool: string;
 	args: string;
 	/** Matches the producing tool_execution_start/update/end event. */
@@ -58,7 +66,7 @@ interface ToolEvent {
 	children?: AgentResult[];
 }
 
-interface AgentProgress {
+export interface AgentProgress {
 	agent: string;
 	status: "pending" | "running" | "completed" | "failed";
 	task: string;
@@ -74,7 +82,7 @@ interface AgentProgress {
 	error?: string;
 }
 
-interface AgentResult {
+export interface AgentResult {
 	agent: string;
 	task: string;
 	output: string;
@@ -111,13 +119,11 @@ interface RunRecord {
 	result: AgentResult;
 }
 
-/** A built child invocation. Produced before the `subagent` call returns, so an
- *  agent this machine cannot launch fails the call itself instead of surfacing
- *  as a background failure minutes later. */
-interface PreparedRun {
-	args: string[];
-	tempDir: string;
-	childEnv: NodeJS.ProcessEnv | undefined;
+/** A built child invocation, plus which runner built it. Produced before the
+ *  `subagent` call returns, so an undispatchable agent fails the call itself
+ *  instead of surfacing as a background failure minutes later. */
+interface PreparedRun extends RunnerArgs {
+	runner: RunnerName;
 }
 
 // ── Config ─────────────────────────────────────────────────────────────
@@ -128,6 +134,11 @@ interface ExtensionConfig {
 	masterRatio?: number;
 	minPaneRows?: number;
 	models?: Record<string, string>;
+	/** Agent name → runner, plus an optional `default`. Same precedence shape as
+	 *  `models`: per-agent config → default config → agent frontmatter → `pi`. */
+	runners?: Record<string, string>;
+	/** Settings for the claude runner. Ignored by pi-run agents. */
+	claude?: ClaudeRunnerConfig;
 	toolExtensions?: Record<string, string>;
 	inherit?: InheritConfig;
 }
@@ -253,6 +264,8 @@ function loadAgents(): AgentConfig[] {
 			.split(",")
 			.map((t) => t.trim())
 			.filter(Boolean);
+		const rawRunner = (frontmatter as Record<string, string>).runner?.trim();
+		if (rawRunner && !isRunner(rawRunner)) throw new Error(`Agent ${frontmatter.name}: unknown runner ${rawRunner} (expected ${RUNNERS.join(" or ")})`);
 		const rawSubagentAgents = (frontmatter as Record<string, string>).subagent_agents;
 		const subagentAgents = rawSubagentAgents
 			? rawSubagentAgents.split(",").map((t) => t.trim()).filter(Boolean)
@@ -266,6 +279,7 @@ function loadAgents(): AgentConfig[] {
 			systemPrompt: body,
 			filePath,
 			subagentAgents,
+			runner: rawRunner as RunnerName | undefined,
 		});
 	}
 	return agents;
@@ -373,7 +387,7 @@ export async function buildPiArgs(
 	task: string,
 	cwd: string,
 	inherit: Required<InheritConfig>,
-): Promise<PreparedRun> {
+): Promise<RunnerArgs> {
 	for (const tool of agent.tools) {
 		if (!BUILTIN_TOOLS.has(tool) && (!CUSTOM_TOOL_EXTENSIONS[tool] || !fs.existsSync(CUSTOM_TOOL_EXTENSIONS[tool]))) {
 			throw new Error(`Agent ${agent.name} requires unavailable tool ${tool}; install its extension or configure toolExtensions`);
@@ -464,54 +478,28 @@ function extractTextFromContent(content: unknown): string {
 	return "";
 }
 
-/** Collapse any whitespace run (incl. newlines) into a single space. Used to
- *  keep tool-arg previews to one renderable line in collapsed view. */
-function flatten(s: string): string {
-	return s.replace(/\s+/g, " ").trim();
-}
-
-// Per-event hard cap on stored arg previews. Even in expanded view we don't
-// want a 50KB bash heredoc sitting in memory per tool call across last-20
-// `recentTools` slots per agent across N agents. A few KB covers any realistic
-// command; anything longer is almost certainly a generated payload the user
-// doesn't need to read inline anyway.
-const MAX_ARG_PREVIEW = 4000;
-
-function extractToolArgsPreview(args: Record<string, unknown>): string {
-	const cap = (s: string) => (s.length > MAX_ARG_PREVIEW ? s.slice(0, MAX_ARG_PREVIEW) + "…" : s);
-	if (args.command) return cap(flatten(String(args.command)));
-	if (args.path) return cap(flatten(String(args.path)));
-	if (args.query) return `"${cap(flatten(String(args.query)))}"`;
-	if (args.url) return cap(flatten(String(args.url)));
-	if (args.pattern) return cap(flatten(String(args.pattern)));
-	// `subagent` tool args: show which agent(s) it's calling, not the full task body.
-	if (args.agent) return flatten(String(args.agent));
-	if (Array.isArray(args.tasks)) {
-		const names = (args.tasks as Array<{ agent?: string }>)
-			.map((t) => t?.agent || "?")
-			.join(", ");
-		return `parallel(${names})`;
-	}
-	return cap(flatten(JSON.stringify(args)));
-}
-
 /**
  * Build a child invocation without starting it.
  *
  * Split out of `runSubagent` so that everything knowable to be wrong up front —
- * an agent declaring a tool this machine cannot supply — throws from
- * `execute()` itself. Under the async contract the run outlives the tool call,
- * so an error raised after dispatch would reach the model as a background
- * failure with no call to attach it to. A caller mistake should fail the call
- * that made it.
+ * an agent declaring a tool this machine cannot supply, a model string no
+ * runner can use — throws from `execute()` itself. Under the async contract the
+ * run outlives the tool call, so an error raised after dispatch would reach the
+ * model as a background failure with no call to attach it to. A caller mistake
+ * should fail the call that made it.
  */
 export async function prepareSubagent(
 	agent: AgentConfig,
 	task: string,
 	cwd: string,
 	inherit: Required<InheritConfig>,
+	claudeConfig: ClaudeRunnerConfig,
 ): Promise<PreparedRun> {
-	return await buildPiArgs(agent, task, cwd, inherit);
+	const runner: RunnerName = agent.runner ?? "pi";
+	const built = runner === "claude"
+		? await buildClaudeArgs(agent, task, cwd, inherit, claudeConfig)
+		: await buildPiArgs(agent, task, cwd, inherit);
+	return { ...built, runner };
 }
 
 /**
@@ -530,7 +518,10 @@ async function runSubagent(
 	onUpdate?: () => void,
 	layout?: MasterLayout,
 ): Promise<AgentResult> {
-	const { args, tempDir, childEnv } = prepared;
+	const { runner, args, tempDir, childEnv, stdin } = prepared;
+	// Defence in depth: execute() already refuses this combination with a better
+	// message, but a pane child has no result channel for a non-pi runner.
+	if (layout && runner !== "pi") throw new Error(`The ${runner} runner supports the process backend only`);
 	const command = args[0];
 	const spawnArgs = args.slice(1);
 
@@ -555,7 +546,7 @@ async function runSubagent(
 		let buf = "";
 		let stderrBuf = "";
 
-		const processLine = (line: string) => {
+		const processPiLine = (line: string) => {
 			if (!line.trim()) return;
 			try {
 				const evt = JSON.parse(line) as any;
@@ -637,21 +628,8 @@ async function runSubagent(
 						const text = extractTextFromContent(evt.message.content);
 						if (text) {
 							result.output = text;
-							// Extract just the prose "thinking" text — skip code blocks
-							const proseLines: string[] = [];
-							let inCodeBlock = false;
-							for (const line of text.split("\n")) {
-								if (line.trimStart().startsWith("```")) {
-									inCodeBlock = !inCodeBlock;
-									continue;
-								}
-								if (!inCodeBlock && line.trim()) {
-									proseLines.push(line.trim());
-								}
-							}
-							if (proseLines.length > 0) {
-								progress.lastMessage = proseLines.slice(0, 3).join(" ");
-							}
+							const summary = proseSummary(text);
+							if (summary) progress.lastMessage = summary;
 						}
 					}
 
@@ -662,8 +640,12 @@ async function runSubagent(
 			}
 		};
 
+		const processLine = runner === "claude"
+			? makeClaudeLineHandler({ progress, result, fireUpdate, startTime })
+			: processPiLine;
+
 		if (layout) {
-			const env = { ...(childEnv ?? process.env), PI_SUBAGENT_LAYOUT_DIR: layout.directory,
+			const env = { ...childEnv, PI_SUBAGENT_LAYOUT_DIR: layout.directory,
 				PI_SUBAGENT_MASTER: layout.master, PI_SUBAGENT_BACKEND: "herdr",
 				PI_SUBAGENT_TOOL_EXTENSIONS: JSON.stringify(CUSTOM_TOOL_EXTENSIONS) };
 			void runInPane(layout, { command, args: spawnArgs, cwd, env, directory: tempDir,
@@ -673,8 +655,21 @@ async function runSubagent(
 			}, error => { progress.error = String(error); resolve(1); });
 			return;
 		}
-		const proc = spawn(command, spawnArgs, { cwd, stdio: ["ignore", "pipe", "pipe"],
-			env: { ...(childEnv ?? process.env), PI_SUBAGENT_BACKEND: "process", PI_SUBAGENT_TOOL_EXTENSIONS: JSON.stringify(CUSTOM_TOOL_EXTENSIONS) } });
+		// PI_SUBAGENT_* is how a pi child is told which transport and tool
+		// extensions it inherited; it means nothing to any other runner.
+		const env = runner === "pi"
+			? { ...childEnv, PI_SUBAGENT_BACKEND: "process", PI_SUBAGENT_TOOL_EXTENSIONS: JSON.stringify(CUSTOM_TOOL_EXTENSIONS) }
+			: childEnv;
+		// A runner that supplies `stdin` takes its task that way rather than as an
+		// argument — Claude Code's variadic `--tools`/`--allowedTools` would
+		// otherwise swallow a trailing positional prompt as one more tool name.
+		const proc = spawn(command, spawnArgs, { cwd, stdio: [stdin === undefined ? "ignore" : "pipe", "pipe", "pipe"], env });
+		if (stdin !== undefined && proc.stdin) {
+			// A child that exits before reading gives us EPIPE; the close handler
+			// already reports the real failure, so don't let it crash the parent.
+			proc.stdin.on("error", () => {});
+			proc.stdin.end(stdin);
+		}
 		let closed = false;
 		let killTimer: ReturnType<typeof setTimeout> | undefined;
 		const kill = () => {
@@ -682,14 +677,14 @@ async function runSubagent(
 			proc.kill("SIGTERM");
 			killTimer = setTimeout(() => { if (!closed) proc.kill("SIGKILL"); }, 3000);
 		};
-		proc.stdout.on("data", (d: Buffer) => {
+		proc.stdout?.on("data", (d: Buffer) => {
 			buf += d.toString();
 			const lines = buf.split("\n");
 			buf = lines.pop() || "";
 			lines.forEach(processLine);
 		});
 
-		proc.stderr.on("data", (d: Buffer) => {
+		proc.stderr?.on("data", (d: Buffer) => {
 			stderrBuf += d.toString();
 		});
 
@@ -915,6 +910,15 @@ function renderAgentProgress(
 	return c;
 }
 
+/**
+ * The in-flight roster, pinned above the editor.
+ *
+ * This is the async contract's main surface. A dispatched run's tool call
+ * resolves immediately, and the result message that eventually lands gets
+ * pushed up the transcript by whatever is said next — so "what is running right
+ * now" has to live somewhere that does not scroll. One line per run, oldest
+ * first, and the widget disappears entirely when nothing is in flight.
+ */
 function renderRunsWidget(records: RunRecord[], theme: Theme): Component {
 	// One width-aware component rather than a Container of pre-built rows: a
 	// widget is rendered at whatever width the TUI hands it, which is not the
@@ -1032,6 +1036,9 @@ export default function (pi: ExtensionAPI) {
 	if (!Number.isInteger(concurrency) || concurrency < 1) throw new Error("maxConcurrency must be a positive integer");
 	if (config.masterRatio !== undefined && (!Number.isFinite(config.masterRatio) || config.masterRatio < 0.2 || config.masterRatio > 0.8)) throw new Error("masterRatio must be between 0.2 and 0.8");
 	if (config.minPaneRows !== undefined && (!Number.isInteger(config.minPaneRows) || config.minPaneRows < 3)) throw new Error("minPaneRows must be an integer >= 3");
+	for (const [agent, runner] of Object.entries(config.runners ?? {})) {
+		if (!isRunner(runner)) throw new Error(`runners.${agent} must be one of ${RUNNERS.join(", ")}`);
+	}
 	const inherit = resolveInherit(config);
 	const semaphore = new Semaphore(concurrency);
 	let backend = (process.env.PI_SUBAGENT_BACKEND ?? config.backend ?? "auto") as "auto" | "herdr" | "process";
@@ -1115,7 +1122,9 @@ export default function (pi: ExtensionAPI) {
 			const value = args.trim();
 			if (["auto", "herdr", "process"].includes(value)) backend = value as typeof backend;
 			else if (value && value !== "status") { ctx.ui.notify("Usage: /subagents-herdr [auto|herdr|process|status]", "warning"); return; }
-			ctx.ui.notify(`Subagents: ${backend}; master-left ${Math.round((config.masterRatio ?? 0.6) * 100)}%; stack-right; ${concurrency} concurrent`, "info");
+			const inherited = [inherit.extensions && "extensions", inherit.skills && "skills"].filter(Boolean).join("+") || "nothing";
+			const defaultRunner = config.runners?.default ?? "pi";
+			ctx.ui.notify(`Subagents: ${backend}; ${defaultRunner} runner; master-left ${Math.round((config.masterRatio ?? 0.6) * 100)}%; stack-right; ${concurrency} concurrent; children inherit ${inherited}`, "info");
 		},
 	});
 	agents = loadAgents();
@@ -1128,6 +1137,8 @@ export default function (pi: ExtensionAPI) {
 		agents = agents.filter((a) => SUBAGENT_ALLOWLIST.includes(a.name));
 	}
 
+	// Built after the registry is loaded and allowlist-filtered, so the model is
+	// told about exactly the agents this process can actually dispatch.
 	const prompt = buildPromptSurface(agents);
 	pi.registerTool({
 		name: "subagent",
@@ -1139,6 +1150,7 @@ export default function (pi: ExtensionAPI) {
 			agent: Type.String({ description: `Which agent to dispatch: ${agents.map((a) => a.name).join(", ") || "(none registered)"}` }),
 			task: Type.String({ description: "Self-contained brief for the subagent. It shares none of this conversation, so restate the goal, the constraints, any paths you already know, and the output shape you want back." }),
 			cwd: Type.Optional(Type.String({ description: "Working directory for the agent process" })),
+			runner: Type.Optional(Type.String({ description: `Which child process runs the agent: ${RUNNERS.join(" or ")}. Omit unless the user explicitly asked for one — the configured default (normally pi) is right otherwise.` })),
 		}),
 
 		// `onUpdate` is unused: streaming partial results into a tool call only
@@ -1147,6 +1159,9 @@ export default function (pi: ExtensionAPI) {
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
 			const cwd = ctx.cwd;
 
+			if (params.runner !== undefined && !isRunner(params.runner)) {
+				throw new Error(`Unknown runner: ${params.runner}. Available runners: ${RUNNERS.join(", ")}.`);
+			}
 			if (!params.agent || !params.task) {
 				throw new Error("`subagent` requires both `agent` and `task`. To fan out work, emit multiple `subagent` tool calls in the same turn — they run in parallel.");
 			}
@@ -1154,6 +1169,7 @@ export default function (pi: ExtensionAPI) {
 			const definition = agents.find((a) => a.name === params.agent);
 			const agent = definition ? { ...definition,
 				model: config.models?.[definition.name] ?? config.models?.default ?? (definition.model || (ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "")),
+				runner: (params.runner ?? config.runners?.[definition.name] ?? config.runners?.default ?? definition.runner ?? "pi") as RunnerName,
 			} : undefined;
 			if (!agent) {
 				const available = agents.map((a) => a.name).join(", ") || "none";
@@ -1171,7 +1187,13 @@ export default function (pi: ExtensionAPI) {
 			// A pinned path is loaded explicitly, so it is no longer discovery's job.
 			for (const tool of Object.keys(config.toolExtensions ?? {})) DISCOVERED_TOOL_EXTENSIONS.delete(tool);
 			Object.assign(CUSTOM_TOOL_EXTENSIONS, config.toolExtensions);
-			const useHerdr = backend === "herdr" || (backend === "auto" && process.env.HERDR_ENV === "1");
+			// Only pi children can report back from a pane: the sidecar that bridges
+			// their events (`herdr/child.ts`) is itself a pi extension. `auto` picks
+			// the process backend for anything else; an explicit `herdr` says so.
+			if (agent.runner !== "pi" && backend === "herdr") {
+				throw new Error(`Agent ${agent.name} runs under the ${agent.runner} runner, which supports the process backend only. Select /subagents-herdr process or auto.`);
+			}
+			const useHerdr = agent.runner === "pi" && (backend === "herdr" || (backend === "auto" && process.env.HERDR_ENV === "1"));
 			if (useHerdr && !layout) {
 				if (process.env.HERDR_ENV !== "1" || !process.env.HERDR_PANE_ID) throw new Error("Run Pi inside Herdr or select /subagents-herdr process");
 				const directory = process.env.PI_SUBAGENT_LAYOUT_DIR ?? (ownedLayoutDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-master-")));
@@ -1189,7 +1211,7 @@ export default function (pi: ExtensionAPI) {
 
 			// Built before the ack so an agent this machine cannot actually launch
 			// fails *this* call, with a message the model can act on immediately.
-			const prepared = await prepareSubagent(agent, params.task, runCwd, inherit);
+			const prepared = await prepareSubagent(agent, params.task, runCwd, inherit, config.claude ?? {});
 
 			const id = `${agent.name}-${++runSeq}`;
 			const result: AgentResult = {

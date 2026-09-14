@@ -23,6 +23,7 @@ The first child splits **right** of the caller. Subsequent children append **dow
 - Nested worker → scout/researcher calls inherit a shared, cross-process-locked stack. They do not split their worker into miniature columns.
 - Parent cancellation/shutdown cleans up owned children. A runner heartbeat terminates a child after loss of its parent. Manual topology changes fail safely instead of rearranging unrelated panes.
 - Outside Herdr, `auto` uses upstream-style headless JSON subprocesses. A Herdr failure is reported, never silently rerun in a second backend.
+- Pluggable **runners**: an agent runs as a Pi child by default, or as a headless Claude Code child (`runner: claude`, process backend only). Both feed the same progress display, concurrency limit and cancellation.
 
 ## Install
 
@@ -61,13 +62,7 @@ Tool call:
 { "agent": "scout", "task": "Map the authentication module; report relevant file paths." }
 ```
 
-The call returns immediately with a handle rather than the answer:
-
-```
-→ scout-1 dispatched, running in background
-```
-
-While it runs, the widget above the editor shows it. When it lands, its report arrives as a `subagent_result` message that wakes the session — there is nothing to wait on or poll.
+`runner` is an optional third field; see [Runners](#runners).
 
 | Agent | Purpose | Allowed tools |
 |---|---|---|
@@ -76,6 +71,50 @@ While it runs, the widget above the editor shows it. When it lands, its report a
 | worker | Isolated implementation | read, write, edit, safe_bash, web_search, fetch_content, subagent |
 
 Worker may spawn only scout/researcher. They cannot delegate further. Include all task context explicitly; conversation history is not copied.
+
+The call returns immediately with a handle rather than the answer:
+
+```
+→ scout-1 dispatched, running in background
+```
+
+While it runs, the widget above the editor shows it. When it lands, its report arrives as a `subagent_result` message that wakes the session — there is nothing to wait on or poll.
+
+## Runners
+
+A **runner** is the child process that executes an agent. `pi` is the default and the only one the Herdr backend can drive. `claude` (prototype) runs the agent as a headless `claude -p --output-format stream-json` process instead, and is **process-backend only**.
+
+Select one per agent in `config.json`, or with `runner:` in an agent's frontmatter:
+
+```json
+{ "runners": { "scout": "claude" }, "models": { "scout": "anthropic/claude-sonnet-5" } }
+```
+
+A single call can also override both, which is how a conversational instruction reaches it — "send that one to claude" needs no config edit or `/reload`:
+
+```json
+{ "agent": "scout", "task": "Map the auth module.", "runner": "claude" }
+```
+
+Precedence: explicit `runner` on the call → per-agent config → `default` config → frontmatter → `pi`. An unrecognised name is refused instead of silently falling back. Under `backend: auto` a claude agent silently uses the process backend even inside Herdr; under an explicit `backend: herdr` it is refused with an error rather than opening a pane that can never report back. The reason is structural: a pane child returns its results through `herdr/child.ts`, which is itself a Pi extension, so only a Pi process can load it.
+
+Everything downstream of the child is shared — the in-flight widget, the steered result and its `Ctrl+O` progress block, the concurrency semaphore, cancellation, and output truncation all work the same for both runners.
+
+**Tool mapping.** Declared tools are translated to Claude Code's built-in names, and anything unmappable fails before the child is spawned. This check is load-bearing: `--tools` silently *drops* names Claude Code does not recognise, so an unvalidated mapping would produce an agent quietly missing a capability it declared.
+
+| Declared | Claude Code | Declared | Claude Code |
+|---|---|---|---|
+| read | `Read` | web_search | `WebSearch` |
+| write | `Write` | web_fetch | `WebFetch` |
+| edit | `Edit` | fetch_content | `WebFetch` |
+| bash | `Bash` | find | `Glob` |
+| grep | `Grep` | ls | `Glob` |
+
+`safe_bash` and `subagent` are rejected, so **worker cannot run under the claude runner**: Claude Code has no filtered shell, and its `Task` tool spawns its own agent types rather than the ones registered here. Scout and researcher map cleanly. `ls` folds into `Glob` because current Claude Code has no `LS` tool.
+
+**Permissions.** The declared tools are passed as both `--tools` (what exists in the child) and `--allowedTools` (pre-approved, so a headless child never stops on a prompt), alongside `--permission-prompts none` so anything outside that set is denied instead of hanging forever. Pre-approving `bash`, `write` or `edit` is a real grant — the child runs them without asking. Denied calls are reported in the parent's transcript even when the run otherwise succeeds.
+
+**Differences worth knowing.** `inherit.skills` maps to `--disable-slash-commands`; `inherit.extensions` has no exact analogue, and setting it to `false` only refuses your MCP servers (`--strict-mcp-config`) — a claude child still reads your `CLAUDE.md`, settings and hooks. Models are given as pi's `provider/model-id`; an `anthropic/` prefix is stripped and a bare alias (`sonnet`) passes through, while a non-Anthropic parent model is dropped so Claude Code picks its own default. `thinking` maps to `--effort`, with `off` floored at `low`. A claude child re-sends its own full system prompt, so a short task costs noticeably more than the same task on a pi child.
 
 Child Pi sessions automatically exit when the task settles; these are not persistent handoff/resume sessions. Results and live progress remain in the parent's tool transcript. `safe_bash` is a heuristic command filter, **not a security sandbox**; workers have normal file access.
 
@@ -99,6 +138,8 @@ Copy `config.json.example` to `config.json` beside `index.ts` (gitignored):
 - `masterRatio`: left/master share, 0.2–0.8. Only applied when opening the first child.
 - `maxConcurrency`: positive integer, per parent process, default 4.
 - `minPaneRows`: minimum rows per child, default 8. If the shared stack is full, the next call fails with a capacity message rather than creating an unreadable pane. Nested agents count toward this geometry limit, but have their own execution semaphore.
+- `runners`: agent name → `pi` (default) or `claude`; `default` is an optional fallback. See [Runners](#runners).
+- `claude`: settings for the claude runner — `command` (default `claude`, resolved on PATH), `permissionMode` (passed to `--permission-mode`; declared tools are pre-approved regardless), and `maxBudgetUsd` (passed to `--max-budget-usd`, a hard per-child ceiling). Ignored by pi-run agents.
 - `models`: agent name → exact `provider/model-id`; `default` is an optional fallback. Precedence: per-agent config → default config → agent frontmatter → parent model. Bundled agents inherit the parent's current model; no Anthropic credentials are assumed.
 - `toolExtensions`: optional tool name → absolute extension file path; overrides automatic discovery. A pinned tool is always handed to the child explicitly.
 - `inherit.extensions`: load your installed Pi packages in children, default `true`. `false` restores the previous `--no-extensions` isolation, where a child runs stock Pi plus only the extensions backing its declared tools — and therefore ignores whatever those packages read from your configuration.
@@ -136,7 +177,13 @@ PI_TEST_MODEL=provider/model-id PI_TEST_NESTED=1 \
   npx tsx test/live-agent.ts
 ```
 
-The live layout test checks four equal-height children, preserved focus, and rebalancing after middle-pane removal. The live agent test checks actual interactive Pi startup, event bridging, final output, and cleanup. Unit tests cover ownership boundaries, cross-process-manager serialization, capacity, argument conversion, and shell quoting.
+```bash
+# Explicit opt-in: runs a real Pi child AND a real Claude Code child (read-only
+# scouts), and incurs usage on both.
+PI_TEST_MODEL=provider/model-id CLAUDE_TEST_MODEL=sonnet npx tsx test/live-runners.ts
+```
+
+The live layout test checks four equal-height children, preserved focus, and rebalancing after middle-pane removal. The live agent test checks actual interactive Pi startup, event bridging, final output, and cleanup. The live runners test dispatches the same task twice through the real `subagent` tool: once with nothing specified, asserting it went to Pi, and once with `runner: "claude"`, asserting a real headless Claude Code child ran it. Both are checked for tool-call bridging, usage accounting and a completed result. Unit tests cover ownership boundaries, cross-process-manager serialization, capacity, argument conversion, shell quoting, runner selection and its precedence, the claude tool mapping, its argv shape, and its stream-json event adapter.
 
 Herdr configuration and server versions are never modified. API calls are bounded by a timeout. Temporary task/event/environment files are private (directory 0700, files 0600) and removed after completion. Abrupt parent death can leave its temporary files and shell pane behind; the heartbeat stops the child process, but does not delete state owned by a dead parent.
 
