@@ -5,7 +5,7 @@ import { interactiveArgs, shellQuote } from "../herdr/transport.ts";
 
 test("interactive transport removes JSON/print mode and keeps task bytes", () => {
   const task = "Task: 'quotes' !bang $HOME\n中文";
-  const args = interactiveArgs(["--mode", "json", "-p", "--no-session", "--no-extensions", "--model", "provider/model", task]);
+  const args = interactiveArgs(["--mode", "json", "-p", "--session", "/tmp/run/session.jsonl", "--no-extensions", "--model", "provider/model", task]);
   assert.equal(args.includes("-p"), false);
   assert.equal(args.includes("json"), false);
   assert.ok(args[1].endsWith("/herdr/child.ts"));

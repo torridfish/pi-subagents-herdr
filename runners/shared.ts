@@ -26,6 +26,10 @@ export interface RunnerArgs {
 	tempDir: string;
 	childEnv: NodeJS.ProcessEnv | undefined;
 	stdin?: string;
+	/** Where this child persists its conversation, when its runner can be resumed
+	 *  from one. Set by the pi runner; a paused run is restarted from this file
+	 *  with the caller's answer as the next prompt. */
+	sessionPath?: string;
 }
 
 /** Everything a runner's line handler mutates. The handler is called once per

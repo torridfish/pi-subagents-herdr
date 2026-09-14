@@ -402,7 +402,13 @@ export async function buildPiArgs(
 		await fs.promises.writeFile(promptPath, agent.systemPrompt, { encoding: "utf-8", mode: 0o600 });
 	});
 
-	const args = [...piBin.baseArgs, "--mode", "json", "-p", "--no-session"];
+	// A child keeps its conversation in its own run directory rather than in the
+	// user's session store. `--no-session` would be tidier still, but a session
+	// file is what makes a run resumable: a child that pings its caller exits,
+	// and the answer is delivered by restarting pi against this very file.
+	// `--session <path>` on a path that does not exist yet creates it.
+	const sessionPath = path.join(tempDir, "session.jsonl");
+	const args = [...piBin.baseArgs, "--mode", "json", "-p", "--session", sessionPath];
 	if (!inherit.skills) args.push("--no-skills");
 
 	// Separate builtin tools from custom tools. Both kinds share the same
@@ -463,7 +469,7 @@ export async function buildPiArgs(
 		childEnv.PI_SUBAGENT_ALLOWED = agent.subagentAgents.join(",");
 	}
 
-	return { args: [piBin.command, ...args], tempDir, childEnv };
+	return { args: [piBin.command, ...args], tempDir, childEnv, sessionPath };
 }
 
 function extractTextFromContent(content: unknown): string {
