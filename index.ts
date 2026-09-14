@@ -104,6 +104,10 @@ interface Details {
 	/** Set on the `subagent` call's ack: the handle of the run it started. Absent
 	 *  on the steered completion message, which carries the finished result. */
 	dispatched?: string;
+	/** Set on a steered message: which run it is about. The block renders under
+	 *  this name, so a report can be told apart from the three other subagents'
+	 *  reports as well as from the main agent's own prose. */
+	handle?: string;
 }
 
 /**
@@ -675,6 +679,10 @@ export async function prepareSubagent(
  */
 async function runSubagent(
 	agent: AgentConfig,
+	/** The run's handle (`researcher-2`). Names the child's pane, so a stack of
+	 *  three researchers is three distinguishable panes rather than three panes
+	 *  called "researcher". */
+	handle: string,
 	prepared: PreparedRun,
 	result: AgentResult,
 	cwd: string,
@@ -861,7 +869,7 @@ async function runSubagent(
 				delivered();
 			});
 			void runInPane(layout, { command, args: spawnArgs, cwd, env, directory: tempDir,
-				name: agent.name, signal, onLine: processLine, onPane: id => { paneId = id; } }).then(exit => {
+				name: handle, signal, onLine: processLine, onPane: id => { paneId = id; } }).then(exit => {
 				if (exit.error) progress.error = exit.error;
 				resolve(exit.code);
 			}, error => { progress.error = String(error); resolve(1); });
@@ -1026,6 +1034,11 @@ function getTermWidth(): number {
 	return process.stdout.columns || 120;
 }
 
+/** How much of a finished subagent's report the collapsed block shows. Source
+ *  lines, not screen lines: they wrap, and a report that opens with a wall of
+ *  prose should not push the rest of the transcript off the screen. */
+const COLLAPSED_REPORT_LINES = 8;
+
 function renderAgentProgress(
 	r: AgentResult,
 	theme: Theme,
@@ -1059,6 +1072,11 @@ function renderAgentProgress(
 			c.addChild(new Text(indent + truncLine(content, innerW), 0, 0));
 		}
 	};
+
+	/** Prose that must survive the collapsed view intact — the question, the
+	 *  report — wraps instead of being cut off at the right margin. A tool log
+	 *  line reads fine truncated; half a sentence does not. */
+	const addWrapped = (content: string) => { c.addChild(new Text(indent + content, 0, 0)); };
 
 	// Header: icon + agent + stats (always one line)
 	const icon = isRunning
@@ -1125,15 +1143,26 @@ function renderAgentProgress(
 	// wherever the reader's eye lands — and it stays visible when collapsed.
 	if (isWaiting && r.question) {
 		if (!nested) c.addChild(new Spacer(1));
-		addLine(theme.fg("warning", `Asks: ${r.question}`));
+		addWrapped(theme.fg("warning", `Asks: ${r.question}`));
 	}
 
-	// Expanded final output — only at depth 0. Nested levels are summarized via
-	// their own tool list; the master-level result block is enough context.
-	if (!nested && !isRunning && !isWaiting && r.output && expanded) {
+	// The report — only at depth 0. Nested levels are summarized via their own
+	// tool list; the master-level result block is enough context.
+	//
+	// Shown in both views, not just the expanded one: this is what the subagent
+	// was dispatched to produce, and a block that hides it behind ctrl+o leaves
+	// the reader with a tool log and no answer. Collapsed gets the head of it,
+	// which is where a well-behaved agent puts its conclusion.
+	if (!nested && !isRunning && !isWaiting && r.output) {
 		c.addChild(new Spacer(1));
-		const mdTheme = getMarkdownTheme();
-		c.addChild(new Markdown(r.output, 0, 0, mdTheme));
+		if (expanded) {
+			c.addChild(new Markdown(r.output, 0, 0, getMarkdownTheme()));
+		} else {
+			const lines = r.output.split("\n").filter((line, i, all) => line.trim() || (i > 0 && all[i - 1].trim()));
+			for (const line of lines.slice(0, COLLAPSED_REPORT_LINES)) addWrapped(theme.fg("text", line));
+			const rest = lines.length - COLLAPSED_REPORT_LINES;
+			if (rest > 0) addLine(theme.fg("dim", `… ${rest} more line${rest === 1 ? "" : "s"} — ctrl+o`));
+		}
 	}
 
 	// Usage line. Includes the context %/max gauge at every depth — each
@@ -1162,6 +1191,37 @@ function renderAgentProgress(
 	}
 
 	return c;
+}
+
+/**
+ * Wrap a rendered block in a titled frame.
+ *
+ * A subagent's report arrives as a message in the transcript, where by default
+ * it looks exactly like something the main agent said — same column, same
+ * colours, no seam. The frame is the seam: everything inside it was written by
+ * a different agent in a different context window.
+ *
+ * Drawn rather than delegated to a Box because pi-tui's Box does padding and
+ * background, not a border, and a left gutter survives a narrow terminal that a
+ * full box would wrap into confetti.
+ */
+function framed(title: string, inner: Component, theme: Theme): Component {
+	const GUTTER = 2;
+	return {
+		invalidate() { inner.invalidate?.(); },
+		render(width: number): string[] {
+			// Below this there is no room for a gutter and the content both; the
+			// content wins.
+			if (width < 24) return inner.render(width);
+			const head = `${theme.fg("borderMuted", "╭─ ")}${theme.fg("accent", title)} `;
+			const rule = Math.max(0, width - visibleWidth(head));
+			return [
+				head + theme.fg("borderMuted", "─".repeat(rule)),
+				...inner.render(width - GUTTER).map((line) => `${theme.fg("borderMuted", "│")} ${line}`),
+				theme.fg("borderMuted", "╰" + "─".repeat(Math.max(0, width - 1))),
+			];
+		},
+	};
 }
 
 /**
@@ -1361,7 +1421,7 @@ export default function (pi: ExtensionAPI) {
 		const result = record.result;
 		const settled = (async () => {
 			try {
-				await semaphore.run(() => runSubagent(record.definition, record.prepared, result, record.cwd, signal, {
+				await semaphore.run(() => runSubagent(record.definition, record.id, record.prepared, result, record.cwd, signal, {
 					onUpdate: updateWidget,
 					// Mid-run, not at the end: the child is still alive and parked, so
 					// the model hears the question while the run is open.
@@ -1404,7 +1464,7 @@ export default function (pi: ExtensionAPI) {
 			? `Subagent ${record.id} (${record.agent}) failed after ${elapsed}: ${r.progress.error || r.output || `exited ${r.exitCode}`}`
 			: `Subagent ${record.id} (${record.agent}) finished in ${elapsed}.\n\n${r.output || "(no output)"}`;
 		pi.sendMessage<Details>(
-			{ customType: "subagent_result", content, display: true, details: { results: [r] } },
+			{ customType: "subagent_result", content, display: true, details: { results: [r], handle: record.id } },
 			{ triggerTurn: true, deliverAs: "steer" },
 		);
 	};
@@ -1425,7 +1485,7 @@ export default function (pi: ExtensionAPI) {
 			+ `subagent_message(handle: "${record.id}", message: …). If the answer is the user's to give rather than yours, ask them — `
 			+ `the child waits, and costs nothing while it does.`;
 		pi.sendMessage<Details>(
-			{ customType: "subagent_question", content, display: true, details: { results: [r] } },
+			{ customType: "subagent_question", content, display: true, details: { results: [r], handle: record.id } },
 			{ triggerTurn: true, deliverAs: "steer" },
 		);
 	};
@@ -1437,7 +1497,10 @@ export default function (pi: ExtensionAPI) {
 	const renderSteeredRun = (message: { details?: Details }, options: { expanded: boolean }, theme: Theme) => {
 		const result = message.details?.results?.[0];
 		if (!result) return undefined;
-		return renderAgentProgress(result, theme, options.expanded, getTermWidth() - 4);
+		// Two columns of frame, then the usual margin the block already assumed.
+		const block = renderAgentProgress(result, theme, options.expanded, getTermWidth() - 6);
+		const handle = message.details?.handle;
+		return framed(handle ? `${handle} · ${result.agent}` : result.agent, block, theme);
 	};
 	pi.registerMessageRenderer<Details>("subagent_result", renderSteeredRun);
 	// A pause renders the same way a result does. It is the same run, read at a
