@@ -15,9 +15,10 @@ One child                 Three children
 
 The first child splits **right** of the caller. Subsequent children append **down** in the stack; owned stack splits are rebalanced to equal heights. The master never becomes another shrinking stack pane. Child completion closes its pane and rebalances the remainder. The final child closing restores the original caller region.
 
-- Keeps upstream's `subagent({ agent, task, cwd? })`, streamed tool/usage display, `Ctrl+O`, isolated contexts, and per-process concurrency limit.
+- Keeps upstream's `subagent({ agent, task, cwd? })`, isolated contexts, and per-process concurrency limit.
 - Real interactive Pi TUI in every child pane; structured event sidecars return results to the parent. No screen scraping or duplicate model runs.
-- **Task-scoped, synchronous tool semantics**: calls wait for results; multiple tool calls run concurrently. This is **not** the async notification/resume/planner system from `pi-herdr-subagents`.
+- **Asynchronous dispatch**: `subagent` returns a handle (`scout-1`) as soon as the child starts, so the parent session stays interactive while children run. Each finished run is steered back as its own message, which wakes the parent and starts a turn. Results arrive independently, in whatever order they finish.
+- A pinned widget above the editor lists every run still in flight, with its current tool call and elapsed time. The full progress block — tool log, prose, usage, context gauge, `Ctrl+O` — renders on the steered result message when the run lands.
 - Never focuses a child, creates another tab/workspace, or rearranges unrelated existing panes. A pre-existing multipane tab uses the caller's region, not the entire tab.
 - Nested worker → scout/researcher calls inherit a shared, cross-process-locked stack. They do not split their worker into miniature columns.
 - Parent cancellation/shutdown cleans up owned children. A runner heartbeat terminates a child after loss of its parent. Manual topology changes fail safely instead of rearranging unrelated panes.
@@ -59,6 +60,14 @@ Tool call:
 ```json
 { "agent": "scout", "task": "Map the authentication module; report relevant file paths." }
 ```
+
+The call returns immediately with a handle rather than the answer:
+
+```
+→ scout-1 dispatched, running in background
+```
+
+While it runs, the widget above the editor shows it. When it lands, its report arrives as a `subagent_result` message that wakes the session — there is nothing to wait on or poll.
 
 | Agent | Purpose | Allowed tools |
 |---|---|---|

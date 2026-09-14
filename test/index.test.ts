@@ -8,6 +8,7 @@ test("extension registers its tool and backend command, rejects bad requests bef
   extension({ registerTool: (tool: any) => tools.set(tool.name, tool),
     registerCommand: (name: string, command: any) => commands.set(name, command),
     on: (name: string, fn: any) => handlers.set(name, fn), getAllTools: () => [],
+    registerMessageRenderer() {}, sendMessage() {},
   } as any);
   const ctx = { cwd: process.cwd(), model: { provider: "test", id: "model" },
     modelRegistry: { find: () => undefined }, ui: { notify() {} } };

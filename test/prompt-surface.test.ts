@@ -1,0 +1,63 @@
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { buildPromptSurface, type AgentConfig } from "../index.ts";
+
+const agent = (name: string, description: string, tools: string[]): AgentConfig =>
+  ({ name, description, tools, model: "", thinking: "medium", systemPrompt: "", filePath: "" });
+
+const SCOUT = agent("scout", "Fast codebase recon", ["read", "grep"]);
+const WORKER = agent("worker", "General-purpose worker", ["read", "write"]);
+
+test("the roster the model sees is the registry it can actually dispatch", () => {
+  const { snippet, description } = buildPromptSurface([SCOUT, WORKER]);
+  for (const a of [SCOUT, WORKER]) {
+    assert.ok(snippet.includes(a.name), `snippet omits ${a.name}`);
+    assert.ok(description.includes(`- ${a.name}: ${a.description} (tools: ${a.tools.join(", ")})`), `roster omits ${a.name}`);
+  }
+});
+
+test("a filtered registry leaks no agent the process cannot reach", () => {
+  // A child launched with PI_SUBAGENT_ALLOWED sees a filtered registry; the
+  // point of that filter is that the name is not even in its prompt.
+  const { snippet, description, guidelines } = buildPromptSurface([SCOUT]);
+  const text = [snippet, description, ...guidelines].join("\n");
+  assert.ok(text.includes("scout"));
+  assert.ok(!text.includes("worker"), "a filtered-out agent appeared in the prompt");
+  assert.ok(!text.includes("researcher"));
+});
+
+test("per-agent triggers are emitted only for agents that exist", () => {
+  // Structural rather than string-matched, so rewording a trigger does not
+  // silently turn this into a test of nothing.
+  const none = buildPromptSurface([]).guidelines;
+  const scoutOnly = buildPromptSurface([SCOUT]).guidelines;
+  const both = buildPromptSurface([SCOUT, WORKER]).guidelines;
+  assert.ok(scoutOnly.length > none.length);
+  assert.ok(both.length > scoutOnly.length);
+  assert.ok(scoutOnly.some((g) => g.includes("scout")));
+  assert.ok(!scoutOnly.some((g) => g.includes("worker")));
+
+  // An agent with no canned trigger still appears in the roster, just without one.
+  const custom = buildPromptSurface([agent("auditor", "Third-party agent", ["read"])]);
+  assert.ok(custom.description.includes("- auditor: Third-party agent"));
+  assert.deepEqual(custom.guidelines, none);
+});
+
+test("guidelines lead with when to delegate, not with when not to", () => {
+  const generic = buildPromptSurface([]).guidelines;
+  const { guidelines } = buildPromptSurface([SCOUT, WORKER]);
+  // The old surface opened on "Don't use subagents to parallelize simple I/O",
+  // which was the first thing the model read about the tool. The per-agent
+  // triggers must come before any of the generic hold-back bullets.
+  assert.ok(guidelines[0].includes("scout") || guidelines[0].includes("worker"), `leads with: ${guidelines[0]}`);
+  assert.ok(!generic.includes(guidelines[0]));
+  assert.ok(guidelines.some((g) => /Do the work yourself/.test(g)), "the anti-pattern bullets should still be there");
+  assert.ok(guidelines.some((g) => /run concurrently/.test(g)));
+});
+
+test("an empty registry degrades instead of promising agents that do not exist", () => {
+  const { snippet, description, guidelines } = buildPromptSurface([]);
+  assert.ok(description.includes("(none registered)"));
+  assert.ok(!snippet.includes("("), `snippet should not carry an empty list: ${snippet}`);
+  assert.ok(guidelines.every((g) => !/\b(scout|researcher|worker)\b/.test(g)));
+});

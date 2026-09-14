@@ -13,7 +13,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { getMarkdownTheme, parseFrontmatter, truncateHead, withFileMutationQueue, DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES } from "@earendil-works/pi-coding-agent";
-import { Container, Markdown, Spacer, Text, visibleWidth } from "@earendil-works/pi-tui";
+import { type Component, Container, Markdown, Spacer, Text, visibleWidth } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
 // ── Types ──────────────────────────────────────────────────────────────
@@ -87,6 +87,37 @@ interface AgentResult {
 
 interface Details {
 	results: AgentResult[];
+	/** Set on the `subagent` call's ack: the handle of the run it started. Absent
+	 *  on the steered completion message, which carries the finished result. */
+	dispatched?: string;
+}
+
+/**
+ * One dispatched subagent, tracked from the `subagent` call's ack until its
+ * result is steered back.
+ *
+ * `subagent` returns as soon as the child is dispatched, so the tool call is
+ * gone from the conversation long before the run is. Everything the UI and the
+ * steer need afterwards lives here rather than in the tool call's closure:
+ * `result` is the same object `runSubagent` mutates in place, so the widget
+ * always reads live state without a copy step.
+ */
+interface RunRecord {
+	/** Short, readable handle (`scout-1`). Shown in the widget and named in the
+	 *  steered result so the user and the model can refer to the same run. */
+	id: string;
+	agent: string;
+	startedAt: number;
+	result: AgentResult;
+}
+
+/** A built child invocation. Produced before the `subagent` call returns, so an
+ *  agent this machine cannot launch fails the call itself instead of surfacing
+ *  as a background failure minutes later. */
+interface PreparedRun {
+	args: string[];
+	tempDir: string;
+	childEnv: NodeJS.ProcessEnv | undefined;
 }
 
 // ── Config ─────────────────────────────────────────────────────────────
@@ -342,7 +373,7 @@ export async function buildPiArgs(
 	task: string,
 	cwd: string,
 	inherit: Required<InheritConfig>,
-): Promise<{ args: string[]; tempDir: string; childEnv: NodeJS.ProcessEnv | undefined }> {
+): Promise<PreparedRun> {
 	for (const tool of agent.tools) {
 		if (!BUILTIN_TOOLS.has(tool) && (!CUSTOM_TOOL_EXTENSIONS[tool] || !fs.existsSync(CUSTOM_TOOL_EXTENSIONS[tool]))) {
 			throw new Error(`Agent ${agent.name} requires unavailable tool ${tool}; install its extension or configure toolExtensions`);
@@ -464,49 +495,62 @@ function extractToolArgsPreview(args: Record<string, unknown>): string {
 	return cap(flatten(JSON.stringify(args)));
 }
 
-async function runSubagent(
+/**
+ * Build a child invocation without starting it.
+ *
+ * Split out of `runSubagent` so that everything knowable to be wrong up front —
+ * an agent declaring a tool this machine cannot supply — throws from
+ * `execute()` itself. Under the async contract the run outlives the tool call,
+ * so an error raised after dispatch would reach the model as a background
+ * failure with no call to attach it to. A caller mistake should fail the call
+ * that made it.
+ */
+export async function prepareSubagent(
 	agent: AgentConfig,
 	task: string,
 	cwd: string,
-	signal: AbortSignal | undefined,
 	inherit: Required<InheritConfig>,
-	onUpdate?: (progress: AgentProgress, usage: AgentResult["usage"]) => void,
+): Promise<PreparedRun> {
+	return await buildPiArgs(agent, task, cwd, inherit);
+}
+
+/**
+ * Run a prepared child to completion, mutating `result` in place as it streams.
+ *
+ * `result` belongs to the caller's `RunRecord` rather than being created here:
+ * the widget renders it while the run is still in flight, and the steered
+ * completion message renders the very same object once it lands.
+ */
+async function runSubagent(
+	agent: AgentConfig,
+	prepared: PreparedRun,
+	result: AgentResult,
+	cwd: string,
+	signal: AbortSignal | undefined,
+	onUpdate?: () => void,
 	layout?: MasterLayout,
 ): Promise<AgentResult> {
-	signal?.throwIfAborted();
-	const { args, tempDir, childEnv } = await buildPiArgs(agent, task, cwd, inherit);
+	const { args, tempDir, childEnv } = prepared;
 	const command = args[0];
 	const spawnArgs = args.slice(1);
-
-	const result: AgentResult = {
-		agent: agent.name,
-		task,
-		output: "",
-		exitCode: 0,
-		model: agent.model,
-		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 },
-		progress: {
-			agent: agent.name,
-			status: "running",
-			task,
-			recentTools: [],
-			toolCount: 0,
-			tokens: 0,
-			durationMs: 0,
-			lastMessage: "",
-		},
-	};
 
 	const startTime = Date.now();
 	const progress = result.progress;
 
 	const fireUpdate = throttle(() => {
 		progress.durationMs = Date.now() - startTime;
-		onUpdate?.(progress, result.usage);
+		onUpdate?.();
 	}, 150);
 
 	let exitCode = 1;
 	try {
+		// Inside the try, not above it: `prepare` created tempDir before this run
+		// was queued, so an abort that lands while it waits for a semaphore slot
+		// still has to unwind through the cleanup below.
+		signal?.throwIfAborted();
+		// Past the semaphore — this run is no longer queued.
+		progress.status = "running";
+		onUpdate?.();
 		exitCode = await new Promise<number>((resolve) => {
 		let buf = "";
 		let stderrBuf = "";
@@ -739,7 +783,6 @@ class Semaphore {
 // ── Rendering ─────────────────────────────────────────────────────────
 
 type Theme = ExtensionContext["ui"]["theme"];
-type Component = ReturnType<typeof Text.prototype.render> extends string[] ? Text : any;
 
 function getTermWidth(): number {
 	return process.stdout.columns || 120;
@@ -872,6 +915,115 @@ function renderAgentProgress(
 	return c;
 }
 
+function renderRunsWidget(records: RunRecord[], theme: Theme): Component {
+	// One width-aware component rather than a Container of pre-built rows: a
+	// widget is rendered at whatever width the TUI hands it, which is not the
+	// terminal width, so laying rows out ahead of time wrapped the header rule
+	// and left the activity column unbudgeted.
+	return {
+		invalidate() {},
+		render(width: number): string[] {
+			const label = `${records.length} subagent${records.length === 1 ? "" : "s"} running`;
+			const head = `── ${label} `;
+			// Narrower than the label itself: drop the rule and clip, rather than
+			// emitting an over-long line for the TUI to wrap.
+			const lines = [theme.fg("dim", visibleWidth(head) >= width
+				? truncLine(label, width)
+				: head + "─".repeat(width - visibleWidth(head)))];
+
+			for (const record of records) {
+				const prog = record.result.progress;
+				const queued = prog.status === "pending";
+				// What the child is doing *now*: its newest still-running tool call,
+				// and only if none is running, its latest prose line. A finished tool
+				// call says nothing about whether the run is still alive.
+				const current = [...prog.recentTools].reverse().find((t) => t.status === "running");
+				const activity = queued
+					? "queued"
+					: current
+						? (current.args ? `${current.tool}: ${current.args}` : current.tool)
+						: prog.lastMessage || "thinking…";
+
+				const elapsed = formatDuration(Date.now() - record.startedAt);
+				// icon + space + id + space, then the activity, then the elapsed time
+				// flush right. Budget the activity so the clock never wraps the row.
+				const gutter = 3 + visibleWidth(record.id);
+				const room = width - gutter - elapsed.length - 1;
+				const body = room > 4 ? truncLine(activity, room) : "";
+				const pad = Math.max(1, width - gutter - visibleWidth(body) - elapsed.length);
+				lines.push(
+					theme.fg(queued ? "dim" : "warning", queued ? "○" : "⟳")
+					+ " " + theme.fg("accent", record.id)
+					+ " " + theme.fg("muted", body)
+					+ " ".repeat(pad) + theme.fg("dim", elapsed),
+				);
+			}
+			return lines;
+		},
+	};
+}
+
+// ── Prompt Surface ────────────────────────────────────────────────────
+
+/**
+ * What the model is told about `subagent`, derived from whichever agents are
+ * actually registered.
+ *
+ * Building it from the registry rather than hardcoding it matters twice over: a
+ * child process runs with a filtered registry (`PI_SUBAGENT_ALLOWED`), and a
+ * third-party extension can register its own agents. Either way the model should
+ * be told exactly what it can reach, and nothing it can't.
+ */
+export function buildPromptSurface(registry: AgentConfig[]): { snippet: string; description: string; guidelines: string[] } {
+	const names = registry.map((a) => a.name);
+	const roster = registry.length > 0
+		? registry.map((a) => `- ${a.name}: ${a.description}${a.tools.length > 0 ? ` (tools: ${a.tools.join(", ")})` : ""}`).join("\n")
+		: "(none registered)";
+
+	// Per-agent triggers, emitted only for agents that exist. These answer the
+	// question the model actually has — "is this one of those?" — which a bare
+	// capability list does not.
+	// Phrased as first-action rules, not advice. A conditional recommendation
+	// ("consider dispatching a scout when…") measurably loses to read/grep: the
+	// model keeps exploring because exploring is always locally reasonable.
+	const triggers: Record<string, string[]> = {
+		scout: [
+			"When a request names an area of the codebase but not the files — \"how does X work\", \"fix the Y flow\", \"where is Z handled\" — your first action is a scout dispatch, not a read or grep of your own.",
+			"If you are about to make a third read/grep call and still do not know where the relevant code lives, stop and dispatch a scout instead — that is the signal you are doing a subagent's job by hand.",
+		],
+		researcher: ["When a question needs several web sources triangulated rather than one page whose URL you already have, your first action is a researcher dispatch, not a search of your own."],
+		worker: [
+			"When a change is self-contained and you can specify it precisely, dispatch a worker rather than making the edits yourself.",
+			"Give a worker the paths. It cannot delegate reading of its own, so an area-shaped brief makes it spend its context orienting instead of editing — scout first if you do not know them yet.",
+		],
+	};
+
+	return {
+		snippet: `Delegate a task to a background child agent with its own context window${names.length > 0 ? ` (${names.join(", ")})` : ""}`,
+		description: [
+			"Delegate a task to a subagent: a child agent that runs in its own fresh context window. Its tool calls, dead ends and intermediate reasoning never enter your context — you get back only its final report.",
+			"",
+			"Available agents:",
+			roster,
+			"",
+			"This call is asynchronous. It returns as soon as the child is dispatched, handing you a short handle like `scout-1` — NOT the child's answer. When the child finishes, the harness automatically delivers its report to you as a new message that wakes you up and starts a turn. You do not have to do anything to receive it: there is nothing to poll, no status to check, and no way to wait.",
+			"",
+			"So do not stall on a dispatch. Finish whatever else the current turn needs, and end the turn once nothing is left that does not depend on the answer. If the user is waiting on that answer and nothing else is outstanding, say what you dispatched and stop — you will be woken when it lands.",
+			"",
+			"The subagent cannot see this conversation. Everything it needs — the goal, the constraints, the file paths you already know, the shape of the answer you want — has to be written into `task`.",
+		].join("\n"),
+		guidelines: [
+			// Never name an agent that is not registered: a filtered child would
+			// otherwise be told to dispatch something it cannot reach.
+			...registry.flatMap((a) => triggers[a.name] ?? []),
+			"Do the work yourself when you already have the path, need exact file bytes in order to edit, or it is a single lookup — a subagent costs a process start and a fresh system prompt.",
+			"Write `task` as a standalone brief: the goal, the constraints, the paths you already know, and the output shape you want back. A subagent left to infer the context will infer it wrong.",
+			"Emit several `subagent` calls in one turn for independent investigations; they run concurrently and their reports arrive separately, each waking you as it lands. Plain parallel read/grep/fetch calls already cover simple I/O — don't wrap those in subagents.",
+			"The handle a dispatch returns is an acknowledgement, never an answer. Never summarise, assume or invent what a child found before its report has actually arrived.",
+		],
+	};
+}
+
 // ── Extension ─────────────────────────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
@@ -887,11 +1039,74 @@ export default function (pi: ExtensionAPI) {
 	let layout: MasterLayout | undefined;
 	let ownedLayoutDir: string | undefined;
 	const shutdown = new AbortController();
-	const running = new Set<Promise<AgentResult>>();
+	const running = new Set<Promise<unknown>>();
+	// Dispatched runs, keyed by the handle the widget shows. A record is removed
+	// the instant its result is steered, so `runs` is exactly "what is in flight".
+	const runs = new Map<string, RunRecord>();
+	let runSeq = 0;
+	// Captured on session_start so the completion path — which has no ctx of its
+	// own — can repaint the widget. Stays undefined outside interactive mode (and
+	// under unit tests), which makes every widget call a silent no-op there.
+	let uiCtx: ExtensionContext | undefined;
+	let ticker: ReturnType<typeof setInterval> | undefined;
+
+	const stopTicker = () => {
+		if (ticker) { clearInterval(ticker); ticker = undefined; }
+	};
+
+	const updateWidget = () => {
+		if (!uiCtx) return;
+		if (runs.size === 0) {
+			stopTicker();
+			uiCtx.ui.setWidget("subagents", undefined);
+			return;
+		}
+		// One repaint a second keeps the elapsed column moving while a child is
+		// quiet. unref() so a stray timer can never hold the process open.
+		if (!ticker) {
+			ticker = setInterval(() => updateWidget(), 1000);
+			ticker.unref?.();
+		}
+		uiCtx.ui.setWidget("subagents", (_tui, theme) => renderRunsWidget([...runs.values()], theme), { placement: "aboveEditor" });
+	};
+
+	/**
+	 * Hand a finished run back to the model.
+	 *
+	 * `deliverAs: "steer"` is what makes the async contract work: the message is
+	 * injected into the turn in progress if there is one and starts a fresh turn
+	 * if there is not. Either way a result lands — whether the user is mid
+	 * conversation or the session has been idle since the dispatch.
+	 */
+	const steerResult = (record: RunRecord) => {
+		const r = record.result;
+		const failed = r.exitCode !== 0 || !!r.progress.error;
+		const elapsed = formatDuration(r.progress.durationMs);
+		const content = failed
+			? `Subagent ${record.id} (${record.agent}) failed after ${elapsed}: ${r.progress.error || r.output || `exited ${r.exitCode}`}`
+			: `Subagent ${record.id} (${record.agent}) finished in ${elapsed}.\n\n${r.output || "(no output)"}`;
+		pi.sendMessage<Details>(
+			{ customType: "subagent_result", content, display: true, details: { results: [r] } },
+			{ triggerTurn: true, deliverAs: "steer" },
+		);
+	};
+
+	// The full progress block — tool log, prose, usage, context gauge — moves here
+	// from the tool result. Under the sync contract it rendered under the call
+	// that was still blocking on it; now the call is long gone and this steered
+	// message is where the finished run gets read.
+	pi.registerMessageRenderer<Details>("subagent_result", (message, options, theme) => {
+		const result = message.details?.results?.[0];
+		if (!result) return undefined;
+		return renderAgentProgress(result, theme, options.expanded, getTermWidth() - 4);
+	});
+
 	Object.assign(CUSTOM_TOOL_EXTENSIONS, JSON.parse(process.env.PI_SUBAGENT_TOOL_EXTENSIONS || "{}"), config.toolExtensions);
+	pi.on("session_start", (_event, ctx) => { uiCtx = ctx; updateWidget(); });
 	pi.on("session_shutdown", async () => {
 		shutdown.abort();
 		await Promise.allSettled([...running]);
+		stopTicker();
 		if (ownedLayoutDir) fs.rmSync(ownedLayoutDir, { recursive: true, force: true });
 	});
 	pi.registerCommand("subagents-herdr", {
@@ -913,25 +1128,23 @@ export default function (pi: ExtensionAPI) {
 		agents = agents.filter((a) => SUBAGENT_ALLOWLIST.includes(a.name));
 	}
 
+	const prompt = buildPromptSurface(agents);
 	pi.registerTool({
 		name: "subagent",
 		label: "Subagent",
-		description:
-			"Run a subagent to complete a task. Subagents have NO context from the current conversation — include all necessary context in the task description.",
-		promptSnippet: "Run subagents for delegated tasks",
-		promptGuidelines: [
-			"Parallel tool calls are your primary parallelism mechanism — put multiple independent read/fetch/search calls in one function_calls block. Don't use subagents to parallelize simple I/O.",
-			"Use subagent to delegate *reasoning and decisions*: codebase exploration (scout), web research (researcher), or isolated code changes (worker)",
-			"For multiple independent subagent tasks, emit multiple `subagent` tool calls in the same turn — they run in parallel automatically.",
-			"Subagents have NO context from the current conversation — include ALL necessary context in the task description",
-		],
+		description: prompt.description,
+		promptSnippet: prompt.snippet,
+		promptGuidelines: prompt.guidelines,
 		parameters: Type.Object({
-			agent: Type.String({ description: "Name of the agent to invoke" }),
-			task: Type.String({ description: "Task description" }),
+			agent: Type.String({ description: `Which agent to dispatch: ${agents.map((a) => a.name).join(", ") || "(none registered)"}` }),
+			task: Type.String({ description: "Self-contained brief for the subagent. It shares none of this conversation, so restate the goal, the constraints, any paths you already know, and the output shape you want back." }),
 			cwd: Type.Optional(Type.String({ description: "Working directory for the agent process" })),
 		}),
 
-		async execute(toolCallId, params, signal, onUpdate, ctx) {
+		// `onUpdate` is unused: streaming partial results into a tool call only
+		// makes sense while the call is still open, and this one resolves at
+		// dispatch. Live progress goes to the widget instead.
+		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
 			const cwd = ctx.cwd;
 
 			if (!params.agent || !params.task) {
@@ -939,7 +1152,9 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			const definition = agents.find((a) => a.name === params.agent);
-			const agent = definition ? { ...definition, model: config.models?.[definition.name] ?? config.models?.default ?? (definition.model || (ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "")) } : undefined;
+			const agent = definition ? { ...definition,
+				model: config.models?.[definition.name] ?? config.models?.default ?? (definition.model || (ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "")),
+			} : undefined;
 			if (!agent) {
 				const available = agents.map((a) => a.name).join(", ") || "none";
 				throw new Error(`Unknown agent: ${params.agent}. Available agents: ${available}`);
@@ -963,10 +1178,21 @@ export default function (pi: ExtensionAPI) {
 				layout = new MasterLayout(directory, process.env.PI_SUBAGENT_MASTER ?? process.env.HERDR_PANE_ID, config.masterRatio ?? 0.6, config.minPaneRows ?? 8);
 			}
 			const effectiveSignal = signal ? AbortSignal.any([signal, shutdown.signal]) : shutdown.signal;
+			// A cancelled turn must not leave a child running in the background, and
+			// the call that requested it should say so rather than acking a dispatch
+			// that never happens.
+			effectiveSignal.throwIfAborted();
 			const slash = agent.model.indexOf("/");
 			const provider = agent.model.slice(0, slash), modelId = agent.model.slice(slash + 1);
 			const contextWindow = provider && modelId ? ctx.modelRegistry.find(provider, modelId)?.contextWindow : undefined;
-			const liveResult: AgentResult = {
+			const runCwd = path.resolve(cwd, params.cwd ?? cwd);
+
+			// Built before the ack so an agent this machine cannot actually launch
+			// fails *this* call, with a message the model can act on immediately.
+			const prepared = await prepareSubagent(agent, params.task, runCwd, inherit);
+
+			const id = `${agent.name}-${++runSeq}`;
+			const result: AgentResult = {
 				agent: params.agent,
 				task: params.task,
 				output: "",
@@ -974,30 +1200,41 @@ export default function (pi: ExtensionAPI) {
 				model: agent.model,
 				contextWindow,
 				usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 },
-				progress: { agent: params.agent, status: "running" as const, task: params.task, recentTools: [], toolCount: 0, tokens: 0, durationMs: 0, lastMessage: "" },
+				// `pending` until the semaphore lets it start — a dispatch that is
+				// still queued should not claim to be working.
+				progress: { agent: params.agent, status: "pending" as const, task: params.task, recentTools: [], toolCount: 0, tokens: 0, durationMs: 0, lastMessage: "" },
 			};
+			const record: RunRecord = { id, agent: agent.name, startedAt: Date.now(), result };
+			runs.set(id, record);
+			updateWidget();
 
-			const work = semaphore.run(() =>
-				runSubagent(agent, params.task!, path.resolve(cwd, params.cwd ?? cwd), effectiveSignal, inherit, (progress, usage) => {
-					liveResult.progress = progress;
-					liveResult.usage = { ...usage };
-					onUpdate?.({
-						content: [{ type: "text", text: "(running...)" }],
-						details: { results: [liveResult] },
-					});
-				}, useHerdr ? layout : undefined),
-			);
-			running.add(work);
-			let result: AgentResult;
-			try { result = await work; } finally { running.delete(work); }
+			// The run outlives this call. `running` is what session_shutdown drains,
+			// and every rejection handler is attached right here: a run that settles
+			// minutes after its tool call must never surface as an unhandled
+			// rejection, and allSettled at shutdown would attach far too late.
+			const settled = (async () => {
+				try {
+					await semaphore.run(() => runSubagent(agent, prepared, result, runCwd, effectiveSignal, updateWidget, useHerdr ? layout : undefined));
+				} catch (error: unknown) {
+					// runSubagent reports child failures through progress.error and a
+					// non-zero exit; reaching here means the launch itself broke.
+					if (result.exitCode === -1) result.exitCode = 1;
+					result.progress.status = "failed";
+					result.progress.error ||= error instanceof Error ? error.message : String(error);
+				}
+				runs.delete(id);
+				updateWidget();
+				steerResult(record);
+			})();
+			running.add(settled);
+			// .finally() attaches a rejection handler to `settled` itself; .catch()
+			// then swallows the derived promise's. Without both, a steer that throws
+			// on a shutting-down session would crash the parent.
+			settled.finally(() => running.delete(settled)).catch(() => {});
 
-			result.contextWindow = contextWindow;
-			const isError = result.exitCode !== 0 || !!result.progress.error;
-			if (isError) throw new Error(result.progress.error || result.output || `Subagent exited ${result.exitCode}`);
 			return {
-				content: [{ type: "text", text: result.output || "(no output)" }],
-				details: { results: [result] },
-				...(isError ? { isError: true } : {}),
+				content: [{ type: "text", text: `Dispatched ${agent.name} as ${id}. It runs in the background: its result will be delivered to you automatically as a new message when it finishes. Do not wait, poll, or re-dispatch — carry on with whatever else the turn needs.` }],
+				details: { results: [result], dispatched: id },
 			};
 		},
 
@@ -1043,19 +1280,18 @@ export default function (pi: ExtensionAPI) {
 		},
 
 		// ── Render: result ──
-		renderResult(result, options, theme, context) {
+		//
+		// One line. The call only ever reports that a child was dispatched — the
+		// run's progress belongs to the pinned widget and its outcome to the
+		// steered `subagent_result` message, both of which outlive this block.
+		renderResult(result, _options, theme) {
 			const details = result.details as Details | undefined;
-			if (!details?.results?.length) {
-				const t = result.content[0];
-				const text = t?.type === "text" ? t.text : "(no output)";
-				return new Text(text.slice(0, 200), 0, 0);
+			if (details?.dispatched) {
+				return new Text(`${theme.fg("dim", "→")} ${theme.fg("accent", details.dispatched)} ${theme.fg("dim", "dispatched, running in background")}`, 0, 0);
 			}
-
-			const w = getTermWidth() - 4;
-			const expanded = options.expanded;
-			const c = new Container();
-			c.addChild(renderAgentProgress(details.results[0], theme, expanded, w));
-			return c;
+			const t = result.content[0];
+			const text = t?.type === "text" ? t.text : "(no output)";
+			return new Text(text.slice(0, 200), 0, 0);
 		},
 	});
 }
