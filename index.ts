@@ -176,6 +176,15 @@ function resolveInherit(config: ExtensionConfig): Required<InheritConfig> {
 }
 
 const EXT_DIR = path.dirname(fileURLToPath(import.meta.url));
+/**
+ * The extension every pi child loads, whichever backend runs it.
+ *
+ * It carries two things a child needs and a standalone Pi session must not get:
+ * the pane event bridge (herdr backend only, switched on by `PI_SUBAGENT_BRIDGE`)
+ * and the `caller_ping` tool. Both are keyed on `PI_SUBAGENT_RUN_DIR`, so the
+ * file is inert anywhere else.
+ */
+const CHILD_EXTENSION = path.join(EXT_DIR, "herdr", "child.ts");
 const AGENTS_DIR = path.join(EXT_DIR, "agents");
 const TOOLS_DIR = path.join(EXT_DIR, "tools");
 const CONFIG_PATH = path.join(EXT_DIR, "config.json");
@@ -442,6 +451,11 @@ export async function buildPiArgs(
 	for (const extPath of extensionPaths) {
 		args.push("--extension", extPath);
 	}
+	// Unconditional, and unconditionally first: both backends get the same child
+	// extension, so the ping sidecar has one code path rather than one per
+	// transport. The herdr backend used to add it on its own when rewriting the
+	// argv for a pane; doing it here covers the process backend too.
+	args.push("--extension", CHILD_EXTENSION);
 
 	args.push("--model", agent.model);
 	args.push("--thinking", agent.thinking);
@@ -464,7 +478,11 @@ export async function buildPiArgs(
 	// extension and filters its agent registry before exposing tool descriptions
 	// to the LLM — so the child literally cannot request an agent outside the
 	// allowlist (the name isn't in its prompt).
-	let childEnv: NodeJS.ProcessEnv = { ...process.env, PI_SUBAGENT_DISCOVERED_TOOLS: [...DISCOVERED_TOOL_EXTENSIONS].join(",") };
+	// PI_SUBAGENT_RUN_DIR is what switches the child extension on, and it is also
+	// where the child leaves a ping for us. The herdr backend sets it from inside
+	// the pane (it is the pane's own run directory, not this snapshot); here it is
+	// the same temp directory either way.
+	let childEnv: NodeJS.ProcessEnv = { ...process.env, PI_SUBAGENT_DISCOVERED_TOOLS: [...DISCOVERED_TOOL_EXTENSIONS].join(","), PI_SUBAGENT_RUN_DIR: tempDir };
 	if (agent.tools.includes("subagent") && agent.subagentAgents !== undefined) {
 		childEnv.PI_SUBAGENT_ALLOWED = agent.subagentAgents.join(",");
 	}

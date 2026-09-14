@@ -9,6 +9,9 @@ const env = { ...spec.env };
 for (const key of Object.keys(env)) if (key.startsWith("HERDR_")) delete env[key];
 for (const [key, value] of Object.entries(process.env)) if (key.startsWith("HERDR_")) env[key] = value;
 env.PI_SUBAGENT_RUN_DIR = directory;
+// Pane children report their events through a sidecar journal; process-backend
+// children are read from stdout and must not write one.
+env.PI_SUBAGENT_BRIDGE = "1";
 for (const key of ["PI_SESSION_ID", "PI_SESSION_FILE", "PI_PROVIDER", "PI_MODEL", "PI_REASONING_LEVEL"]) delete env[key];
 const child = spawn(spec.command, spec.args, { cwd: spec.cwd, env, stdio: "inherit" });
 let finished = false, terminating = false, killer;

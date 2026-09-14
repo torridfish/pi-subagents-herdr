@@ -20,8 +20,9 @@ export function interactiveArgs(args: string[]): string[] {
     if (args[i] === "-p") continue;
     result.push(args[i]);
   }
-  // Options must precede task; Pi also accepts these following its positional prompt.
-  return ["--extension", path.join(here, "child.ts"), ...result];
+  // `child.ts` is not added here: `buildPiArgs` loads it for every pi child, so
+  // a pane child would otherwise be handed the same extension twice.
+  return result;
 }
 
 export async function runInPane(layout: MasterLayout, spec: PaneLaunch): Promise<{ code: number; error?: string }> {

@@ -5,11 +5,15 @@ import { interactiveArgs, shellQuote } from "../herdr/transport.ts";
 
 test("interactive transport removes JSON/print mode and keeps task bytes", () => {
   const task = "Task: 'quotes' !bang $HOME\n中文";
-  const args = interactiveArgs(["--mode", "json", "-p", "--session", "/tmp/run/session.jsonl", "--no-extensions", "--model", "provider/model", task]);
+  const args = interactiveArgs(["--mode", "json", "-p", "--session", "/tmp/run/session.jsonl",
+    "--no-extensions", "--extension", "/pkg/herdr/child.ts", "--model", "provider/model", task]);
   assert.equal(args.includes("-p"), false);
   assert.equal(args.includes("json"), false);
-  assert.ok(args[1].endsWith("/herdr/child.ts"));
   assert.ok(args.includes("--no-extensions"));
+  // The child extension comes from `buildPiArgs` now; the pane rewrite only
+  // strips print mode, and must pass every other option through untouched.
+  assert.equal(args.filter((a) => a === "/pkg/herdr/child.ts").length, 1);
+  assert.deepEqual(args.slice(args.indexOf("--session"), args.indexOf("--session") + 2), ["--session", "/tmp/run/session.jsonl"]);
   assert.equal(args.at(-1), task);
 });
 

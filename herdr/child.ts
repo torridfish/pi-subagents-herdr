@@ -7,13 +7,19 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 export default function (pi: ExtensionAPI) {
   const directory = process.env.PI_SUBAGENT_RUN_DIR;
   if (!directory) return;
+  // Only a pane child needs the event bridge: it has no stdout its parent can
+  // read. `runner.mjs` sets this flag, so the process backend loads the same
+  // extension and gets everything except the journal.
+  const bridged = process.env.PI_SUBAGENT_BRIDGE === "1";
   const emit = (event: unknown) => fs.appendFileSync(path.join(directory, "events.jsonl"), JSON.stringify(event) + "\n", { mode: 0o600 });
   let started = false;
   pi.on("session_start", () => {
-    emit({ type: "bridge_ready" });
-    // Descendants must not write into their parent's event journal.
+    if (bridged) emit({ type: "bridge_ready" });
+    // Descendants must not write into their parent's run directory.
     delete process.env.PI_SUBAGENT_RUN_DIR;
+    delete process.env.PI_SUBAGENT_BRIDGE;
   });
+  if (!bridged) return;
   pi.on("agent_start", () => { started = true; });
   pi.on("tool_execution_start", event => { emit(event); });
   pi.on("tool_execution_update", event => { emit(event); });

@@ -35,14 +35,20 @@ test("inheriting extensions does not widen the tool allowlist", async () => {
 });
 
 test("a tool the child rediscovers is not also passed with --extension", async () => {
+  // Every child is handed the child extension, whatever its tools are; the
+  // counts below are "one for the bridge, plus one per tool we must supply".
+  const CHILD = path.join(EXT_DIR, "herdr", "child.ts");
+  assert.deepEqual((await build(["read"])).filter((a) => a === "--extension").length, 1);
+  assert.ok((await build(["read"])).includes(CHILD));
+
   // `subagent` was seeded as discovered; safe_bash ships in this repo and is not.
   const inherited = await build(["subagent", "safe_bash"]);
-  assert.equal(inherited.filter((a) => a === "--extension").length, 1);
+  assert.equal(inherited.filter((a) => a === "--extension").length, 2);
   assert.ok(inherited.includes(SAFE_BASH));
   assert.ok(!inherited.includes(path.join(EXT_DIR, "index.ts")));
 
   // Without discovery in the child, every declared tool must be handed over.
   const isolated = await build(["subagent", "safe_bash"], { ...DEFAULT_INHERIT, extensions: false });
-  assert.equal(isolated.filter((a) => a === "--extension").length, 2);
+  assert.equal(isolated.filter((a) => a === "--extension").length, 3);
   assert.ok(isolated.includes(path.join(EXT_DIR, "index.ts")));
 });
