@@ -94,6 +94,9 @@ import path from "node:path";
 const dir = process.env.PI_SUBAGENT_RUN_DIR;
 const prompt = process.argv[process.argv.length - 1];
 fs.appendFileSync(process.env.FAKE_PI_LOG, JSON.stringify({ dir, prompt }) + "\\n");
+// Pi writes the session file on the first assistant response; a resume that
+// found none would have nothing to restart from.
+fs.appendFileSync(path.join(dir, "session.jsonl"), JSON.stringify({ type: "message", prompt }) + "\\n");
 const first = !fs.existsSync(path.join(dir, "asked"));
 if (first) {
   fs.writeFileSync(path.join(dir, "asked"), "");
@@ -156,10 +159,15 @@ test("a child that asks a question pauses its run instead of finishing it", asyn
     await until("the run to pause", () => result.progress.status === "paused");
 
     assert.equal(result.question, "Postgres or SQLite?");
-    // Paused is not finished: the run must not be reported as a result, and
-    // must not be marked failed for having exited.
-    assert.deepEqual(steers, []);
+    // Paused is not finished: it must not be reported as a result, and must not
+    // be marked failed for having exited.
     assert.notEqual(result.progress.status, "failed");
+    assert.equal(steers.length, 1);
+    assert.equal(steers[0].customType, "subagent_question");
+    assert.match(steers[0].content, /Postgres or SQLite\?/);
+    // The model has to know which run it is answering, and with what.
+    assert.match(steers[0].content, new RegExp(`subagent_resume\\(handle: "${ack.details.dispatched}"`));
+    assert.equal(steers[0].details.results[0], result, "the question should carry the live record the widget renders");
 
     // The run directory is what makes the pause recoverable — the session file
     // lives there — so the usual end-of-run cleanup has to skip it.
@@ -177,6 +185,63 @@ test("a child that asks a question pauses its run instead of finishing it", asyn
     // an unanswered run's directory is finally reclaimed.
     await handlers.get("session_shutdown")();
     assert.equal(fs.existsSync(launch.dir), false, "an abandoned run directory outlived the session");
+  } finally {
+    pi.restore();
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("an answer puts the same child back to work, and its report lands as usual", async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "resume-test-"));
+  const pi = stubPi(directory);
+  try {
+    const { tools, handlers, steers, paint } = load();
+    const ack = await tools.get("subagent").execute("t", { agent: "scout", task: "pick a store" }, undefined, undefined, ctx);
+    const handle = ack.details.dispatched;
+    const result = ack.details.results[0];
+    await until("the run to pause", () => result.progress.status === "paused");
+    const runDir = pi.launches()[0].dir;
+
+    // Wrong handle, and right handle at the wrong moment, are the two mistakes
+    // a model actually makes here. Both have to fail the call that made them.
+    await assert.rejects(
+      () => tools.get("subagent_resume").execute("r", { handle: "scout-99", answer: "Postgres" }, undefined, undefined, ctx),
+      new RegExp(`Unknown subagent handle: scout-99. Waiting on an answer: ${handle}`),
+    );
+    await assert.rejects(
+      () => tools.get("subagent_resume").execute("r", { handle, answer: "  " }, undefined, undefined, ctx),
+      /requires an answer/,
+    );
+
+    // Resuming means continuing the same run, not starting another one: the
+    // same handle, the same record, the same run directory and session file.
+    const resumed = await tools.get("subagent_resume").execute("r", { handle, answer: "Postgres" }, undefined, undefined, ctx);
+    assert.equal(resumed.details.dispatched, handle);
+    assert.equal(resumed.details.results[0], result);
+    assert.equal(result.question, undefined, "the answered question was left on the record");
+    assert.match(paint(), /1 subagent running/);
+
+    await until("the resumed run to finish", () => result.progress.status === "completed");
+    const launches = pi.launches();
+    assert.equal(launches.length, 2, "the child was not launched a second time");
+    assert.equal(launches[1].dir, runDir, "the resumed child was given a different run directory");
+    // The answer reaches the child as its next prompt, in its own words.
+    assert.match(launches[1].prompt, /Your caller answered your question: Postgres/);
+    assert.match(launches[1].prompt, /Carry on from where you paused/);
+    // And the finished run reports back the way any other run does.
+    assert.equal(result.output, "Done: used " + launches[1].prompt);
+    assert.equal(steers.length, 2);
+    assert.equal(steers[1].customType, "subagent_result");
+    assert.match(steers[1].content, new RegExp(`^Subagent ${handle} \\(scout\\) finished`));
+    assert.equal(paint(), "", "the roster outlived the finished run");
+    // A finished run owns nothing: its directory goes with it, question or not.
+    assert.equal(fs.existsSync(runDir), false);
+
+    await assert.rejects(
+      () => tools.get("subagent_resume").execute("r", { handle, answer: "SQLite" }, undefined, undefined, ctx),
+      /No subagent is waiting on an answer/,
+    );
+    await handlers.get("session_shutdown")();
   } finally {
     pi.restore();
     fs.rmSync(directory, { recursive: true, force: true });

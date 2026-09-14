@@ -35,6 +35,11 @@ export async function runInPane(layout: MasterLayout, spec: PaneLaunch): Promise
   }), { mode: 0o600 });
   await fs.writeFile(path.join(spec.directory, "heartbeat"), "", { mode: 0o600 });
   await fs.writeFile(path.join(spec.directory, "events.jsonl"), "", { mode: 0o600 });
+  // A resumed run reuses its directory, so the previous leg's verdict is still
+  // sitting there. Left in place it would be read as this launch's exit before
+  // the pane has even started.
+  await fs.rm(path.join(spec.directory, "exit.json"), { force: true });
+  await fs.rm(path.join(spec.directory, "cancel"), { force: true });
   const pane = await layout.create(spec.name, spec.cwd);
   let offset = 0, pending = "", ready = false, complete = false;
   let cancelledAt = 0;

@@ -125,8 +125,15 @@ interface RunRecord {
 	result: AgentResult;
 	/** The invocation that started it, kept for as long as the record lives: a
 	 *  paused run owns a temp directory — its session file included — that only
-	 *  a resume or the end of the session may reclaim. */
+	 *  a resume or the end of the session may reclaim. Its trailing prompt is
+	 *  rewritten on resume; everything else is launched again verbatim. */
 	prepared: PreparedRun;
+	/** The rest of what a relaunch needs. Resolved once at dispatch, because by
+	 *  the time an answer arrives the tool call that worked them out is long
+	 *  gone — and the config it read may have been changed since. */
+	definition: AgentConfig;
+	cwd: string;
+	layout?: MasterLayout;
 }
 
 /** A built child invocation, plus which runner built it. Produced before the
@@ -486,7 +493,6 @@ export async function buildPiArgs(
 	args.push("--append-system-prompt", promptPath);
 
 	// Handle long tasks by writing to file
-	const TASK_LIMIT = 8000;
 	if (task.length > TASK_LIMIT) {
 		const taskPath = path.join(tempDir, "task.md");
 		await withFileMutationQueue(taskPath, async () => {
@@ -528,6 +534,10 @@ function extractTextFromContent(content: unknown): string {
 
 /** Where a child leaves a question for its caller, inside its run directory. */
 const PING_FILE = "ping.json";
+
+/** Above this many characters a prompt is handed over as a file rather than as
+ *  an argument, for the task at dispatch and for the answer on resume alike. */
+const TASK_LIMIT = 8000;
 
 /**
  * Read the question a child left on its way out, if it left one.
@@ -1117,6 +1127,8 @@ export function buildPromptSurface(registry: AgentConfig[]): { snippet: string; 
 			"So do not stall on a dispatch. Finish whatever else the current turn needs, and end the turn once nothing is left that does not depend on the answer. If the user is waiting on that answer and nothing else is outstanding, say what you dispatched and stop — you will be woken when it lands.",
 			"",
 			"The subagent cannot see this conversation. Everything it needs — the goal, the constraints, the file paths you already know, the shape of the answer you want — has to be written into `task`.",
+			"",
+			"A child that gets stuck on something only you can decide can pause and ask, instead of guessing. That arrives as a question naming its handle; answer it with `subagent_resume` and the child carries on from exactly where it stopped.",
 		].join("\n"),
 		guidelines: [
 			// Never name an agent that is not registered: a filtered child would
@@ -1180,6 +1192,46 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	/**
+	 * Run a record's child to completion in the background, and deal with
+	 * whatever it comes back as.
+	 *
+	 * Shared by dispatch and resume, which differ only in the prompt the child is
+	 * handed: a run can pause and continue any number of times, and each leg has
+	 * to be wired up the same way — into `running` so shutdown drains it, with
+	 * its rejection handler attached here rather than at shutdown, when it would
+	 * be far too late.
+	 */
+	const launch = (record: RunRecord, signal: AbortSignal) => {
+		const result = record.result;
+		const settled = (async () => {
+			try {
+				await semaphore.run(() => runSubagent(record.definition, record.prepared, result, record.cwd, signal, updateWidget, record.layout));
+			} catch (error: unknown) {
+				// runSubagent reports child failures through progress.error and a
+				// non-zero exit; reaching here means the launch itself broke.
+				if (result.exitCode === -1) result.exitCode = 1;
+				result.progress.status = "failed";
+				result.progress.error ||= error instanceof Error ? error.message : String(error);
+			}
+			// A paused run keeps its place in the roster and its run directory: it
+			// has not finished, it is waiting for an answer.
+			if (result.progress.status === "paused") {
+				updateWidget();
+				steerQuestion(record);
+				return;
+			}
+			runs.delete(record.id);
+			updateWidget();
+			steerResult(record);
+		})();
+		running.add(settled);
+		// .finally() attaches a rejection handler to `settled` itself; .catch()
+		// then swallows the derived promise's. Without both, a steer that throws
+		// on a shutting-down session would crash the parent.
+		settled.finally(() => running.delete(settled)).catch(() => {});
+	};
+
+	/**
 	 * Hand a finished run back to the model.
 	 *
 	 * `deliverAs: "steer"` is what makes the async contract work: the message is
@@ -1200,15 +1252,40 @@ export default function (pi: ExtensionAPI) {
 		);
 	};
 
+	/**
+	 * Wake the model up with a child's question.
+	 *
+	 * Same delivery as a result — the run's outcome and its question are the same
+	 * kind of event, something that lands when it lands — but it names the run
+	 * and the tool that answers it, because a question the model reads and does
+	 * not answer leaves a child paused forever.
+	 */
+	const steerQuestion = (record: RunRecord) => {
+		const r = record.result;
+		const content = `Subagent ${record.id} (${record.agent}) paused after ${formatDuration(r.progress.durationMs)} to ask you:\n\n`
+			+ `${r.question}\n\n`
+			+ `It has kept everything it did so far and will carry on from exactly where it stopped. Answer it with `
+			+ `subagent_resume(handle: "${record.id}", answer: …). If the answer is the user's to give rather than yours, ask them — `
+			+ `the run waits, and costs nothing while it does.`;
+		pi.sendMessage<Details>(
+			{ customType: "subagent_question", content, display: true, details: { results: [r] } },
+			{ triggerTurn: true, deliverAs: "steer" },
+		);
+	};
+
 	// The full progress block — tool log, prose, usage, context gauge — moves here
 	// from the tool result. Under the sync contract it rendered under the call
 	// that was still blocking on it; now the call is long gone and this steered
 	// message is where the finished run gets read.
-	pi.registerMessageRenderer<Details>("subagent_result", (message, options, theme) => {
+	const renderSteeredRun = (message: { details?: Details }, options: { expanded: boolean }, theme: Theme) => {
 		const result = message.details?.results?.[0];
 		if (!result) return undefined;
 		return renderAgentProgress(result, theme, options.expanded, getTermWidth() - 4);
-	});
+	};
+	pi.registerMessageRenderer<Details>("subagent_result", renderSteeredRun);
+	// A pause renders the same way a result does. It is the same run, read at a
+	// different moment, and the block already knows how to show the question.
+	pi.registerMessageRenderer<Details>("subagent_question", renderSteeredRun);
 
 	Object.assign(CUSTOM_TOOL_EXTENSIONS, JSON.parse(process.env.PI_SUBAGENT_TOOL_EXTENSIONS || "{}"), config.toolExtensions);
 	pi.on("session_start", (_event, ctx) => { uiCtx = ctx; updateWidget(); });
@@ -1334,39 +1411,14 @@ export default function (pi: ExtensionAPI) {
 				// still queued should not claim to be working.
 				progress: { agent: params.agent, status: "pending" as const, task: params.task, recentTools: [], toolCount: 0, tokens: 0, durationMs: 0, lastMessage: "" },
 			};
-			const record: RunRecord = { id, agent: agent.name, startedAt: Date.now(), result, prepared };
+			const record: RunRecord = { id, agent: agent.name, startedAt: Date.now(), result, prepared,
+				definition: agent, cwd: runCwd, layout: useHerdr ? layout : undefined };
 			runs.set(id, record);
 			updateWidget();
 
-			// The run outlives this call. `running` is what session_shutdown drains,
-			// and every rejection handler is attached right here: a run that settles
-			// minutes after its tool call must never surface as an unhandled
-			// rejection, and allSettled at shutdown would attach far too late.
-			const settled = (async () => {
-				try {
-					await semaphore.run(() => runSubagent(agent, prepared, result, runCwd, effectiveSignal, updateWidget, useHerdr ? layout : undefined));
-				} catch (error: unknown) {
-					// runSubagent reports child failures through progress.error and a
-					// non-zero exit; reaching here means the launch itself broke.
-					if (result.exitCode === -1) result.exitCode = 1;
-					result.progress.status = "failed";
-					result.progress.error ||= error instanceof Error ? error.message : String(error);
-				}
-				// A paused run keeps its place in the roster and its run directory: it
-				// has not finished, it is waiting for an answer.
-				if (result.progress.status === "paused") {
-					updateWidget();
-					return;
-				}
-				runs.delete(id);
-				updateWidget();
-				steerResult(record);
-			})();
-			running.add(settled);
-			// .finally() attaches a rejection handler to `settled` itself; .catch()
-			// then swallows the derived promise's. Without both, a steer that throws
-			// on a shutting-down session would crash the parent.
-			settled.finally(() => running.delete(settled)).catch(() => {});
+			// The run outlives this call, and may outlive several more before it is
+			// done: `launch` owns everything that happens to it from here.
+			launch(record, effectiveSignal);
 
 			return {
 				content: [{ type: "text", text: `Dispatched ${agent.name} as ${id}. It runs in the background: its result will be delivered to you automatically as a new message when it finishes. Do not wait, poll, or re-dispatch — carry on with whatever else the turn needs.` }],
@@ -1428,6 +1480,90 @@ export default function (pi: ExtensionAPI) {
 			const t = result.content[0];
 			const text = t?.type === "text" ? t.text : "(no output)";
 			return new Text(text.slice(0, 200), 0, 0);
+		},
+	});
+
+	pi.registerTool({
+		name: "subagent_resume",
+		label: "Resume subagent",
+		description:
+			"Answer a subagent that paused to ask you a question, and let it carry on. The child keeps everything it "
+			+ "had done when it asked — its context, its findings, its place in the task — and continues from there with "
+			+ "your answer as its next message. Like `subagent`, this returns as soon as the child is running again: the "
+			+ "eventual report arrives on its own.",
+		promptSnippet: "Answer a paused subagent's question so it can continue",
+		promptGuidelines: [
+			"A paused subagent is not working and will not resume on its own. Answer it with subagent_resume as soon as "
+			+ "you know the answer, and if the answer is the user's to give, ask them rather than guessing on their behalf.",
+		],
+		parameters: Type.Object({
+			handle: Type.String({ description: "The handle of the paused run, as given in its question (for example `scout-1`)." }),
+			answer: Type.String({ description: "The answer, written for someone who cannot see this conversation: state the decision and anything it needs to act on it." }),
+		}),
+
+		async execute(_toolCallId, params, signal, _onUpdate, _ctx) {
+			const handle = params.handle?.trim();
+			const record = handle ? runs.get(handle) : undefined;
+			if (!record) {
+				const waiting = [...runs.values()].filter((r) => r.result.progress.status === "paused").map((r) => r.id);
+				throw new Error(`Unknown subagent handle: ${params.handle}. ${waiting.length ? `Waiting on an answer: ${waiting.join(", ")}.` : "No subagent is waiting on an answer."}`);
+			}
+			if (record.result.progress.status !== "paused") {
+				throw new Error(`Subagent ${record.id} is not waiting for an answer — it is ${record.result.progress.status}. Its report will arrive on its own.`);
+			}
+			const answer = params.answer?.trim();
+			if (!answer) throw new Error(`subagent_resume requires an answer; ${record.id} is waiting on one.`);
+
+			const { tempDir, sessionPath } = record.prepared;
+			if (!sessionPath || !fs.existsSync(sessionPath)) {
+				runs.delete(record.id);
+				updateWidget();
+				fs.rmSync(tempDir, { recursive: true, force: true });
+				throw new Error(`Subagent ${record.id} can no longer be resumed: its session is gone. Dispatch a fresh run with what you have learned.`);
+			}
+			const effectiveSignal = signal ? AbortSignal.any([signal, shutdown.signal]) : shutdown.signal;
+			effectiveSignal.throwIfAborted();
+
+			// Consume the question. It is also how the next pause is detected: a
+			// sidecar left in place would read as an immediate second pause.
+			fs.rmSync(path.join(tempDir, PING_FILE), { force: true });
+
+			// The child is restarted against its own session file, so only the
+			// trailing prompt changes — the model, tools, system prompt and
+			// inherited setup are whatever the dispatch resolved them to.
+			const body = `Your caller answered your question: ${answer}\n\nCarry on from where you paused. Do not start the task over.`;
+			let prompt = body;
+			if (body.length > TASK_LIMIT) {
+				const answerPath = path.join(tempDir, `answer-${Date.now()}.md`);
+				await withFileMutationQueue(answerPath, async () => {
+					await fs.promises.writeFile(answerPath, body, { encoding: "utf-8", mode: 0o600 });
+				});
+				prompt = `@${answerPath}`;
+			}
+			record.prepared = { ...record.prepared, args: [...record.prepared.args.slice(0, -1), prompt] };
+			record.result.question = undefined;
+			record.result.exitCode = -1;
+			record.result.progress.status = "pending";
+			launch(record, effectiveSignal);
+
+			return {
+				content: [{ type: "text", text: `Answered ${record.id}. It is running again in the background: its report will be delivered to you automatically when it finishes. Do not wait or poll — carry on with whatever else the turn needs.` }],
+				details: { results: [record.result], dispatched: record.id },
+			};
+		},
+
+		renderCall(args, theme) {
+			const answer = args.answer ? ` ${theme.fg("dim", (args.answer.length > 60 ? args.answer.slice(0, 60) + "…" : args.answer).replace(/\n/g, " "))}` : "";
+			return new Text(`${theme.fg("toolTitle", theme.bold("subagent_resume"))} ${theme.fg("accent", args.handle ?? "")}${answer}`, 0, 0);
+		},
+
+		renderResult(result, _options, theme) {
+			const details = result.details as Details | undefined;
+			if (details?.dispatched) {
+				return new Text(`${theme.fg("dim", "→")} ${theme.fg("accent", details.dispatched)} ${theme.fg("dim", "resumed, running in background")}`, 0, 0);
+			}
+			const t = result.content[0];
+			return new Text((t?.type === "text" ? t.text : "(no output)").slice(0, 200), 0, 0);
 		},
 	});
 }
