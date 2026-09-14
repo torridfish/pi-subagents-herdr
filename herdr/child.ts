@@ -21,7 +21,9 @@ import { Type } from "typebox";
 export default function (pi: ExtensionAPI) {
   const directory = process.env.PI_SUBAGENT_RUN_DIR;
   if (!directory) return;
-  const pingPath = path.join(directory, "ping.json");
+  /** Set by `caller_ping`, cleared by the answer. While it is set, a settled
+   *  turn parks the session instead of ending it. */
+  let awaitingAnswer = false;
 
   pi.registerTool({
     name: "caller_ping",
@@ -55,22 +57,20 @@ export default function (pi: ExtensionAPI) {
     parameters: Type.Object({
       question: Type.String({ description: "What you need to know, self-contained. Include the options you are weighing and what you will do with the answer." }),
     }),
-    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+    async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
       const question = params.question?.trim();
       if (!question) throw new Error("caller_ping requires a question.");
-      if (fs.existsSync(pingPath)) {
-        throw new Error("You have already asked your caller a question this turn; it can only answer one. Stop here and wait.");
+      if (awaitingAnswer) {
+        throw new Error("You have already asked your caller a question and are still waiting on it; it answers one at a time. Stop here.");
       }
-      // Atomic: the parent polls for this file the moment the child exits, and
-      // must never read a half-written one.
-      fs.writeFileSync(pingPath + ".tmp", JSON.stringify({ type: "ping", question, at: Date.now() }), { mode: 0o600 });
-      fs.renameSync(pingPath + ".tmp", pingPath);
-      // No-op in print mode, where the process exits once the turn is done, and
-      // deferred to idle in a pane — either way the tool result is persisted to
-      // the session file first, so the resumed run reads back a complete turn.
-      ctx.shutdown();
+      // The tool call itself is the message: the parent reads the question off
+      // this session's own event stream, where every tool call already goes.
+      // All this does is the other half — suppress the shutdown that would
+      // otherwise end the session when this turn settles, so the session is
+      // still alive when the answer arrives. Nothing is written, nothing torn down.
+      awaitingAnswer = true;
       return {
-        content: [{ type: "text", text: "Question sent to your caller. Stop now: end your turn without calling another tool and without guessing an answer. You will be resumed with the reply." }],
+        content: [{ type: "text", text: "Question sent to your caller. Stop now: end your turn without calling another tool and without guessing an answer. Your session stays open and the answer arrives as your next message." }],
         details: { question },
       };
     },
@@ -88,15 +88,29 @@ export default function (pi: ExtensionAPI) {
     delete process.env.PI_SUBAGENT_RUN_DIR;
     delete process.env.PI_SUBAGENT_BRIDGE;
   });
-  if (!bridged) return;
   pi.on("agent_start", () => { started = true; });
-  pi.on("tool_execution_start", event => { emit(event); });
-  pi.on("tool_execution_update", event => { emit(event); });
-  pi.on("tool_execution_end", event => { emit(event); });
-  pi.on("message_end", event => { emit(event); });
+  // Whatever arrives is the answer — steered into a running turn, or prompted
+  // into a parked session. Pi emits `input` for both, which is why this is not
+  // hung off `agent_start`.
+  pi.on("input", () => { awaitingAnswer = false; });
+  if (bridged) {
+    pi.on("tool_execution_start", event => { emit(event); });
+    pi.on("tool_execution_update", event => { emit(event); });
+    pi.on("tool_execution_end", event => { emit(event); });
+    pi.on("message_end", event => { emit(event); });
+  }
+  /**
+   * The session ends here, and only here: when a turn settles with nothing
+   * outstanding. A turn that settles while a question is in flight parks
+   * instead — idle, holding its context, until the caller replies. That is the
+   * whole difference between "finished" and "waiting", and the parent reads it
+   * off the same event stream rather than being told separately.
+   */
   pi.on("agent_settled", (_event, ctx) => {
     if (!started) return;
-    emit({ type: "bridge_complete" });
+    if (bridged) emit({ type: "agent_settled" });
+    if (awaitingAnswer) return;
+    if (bridged) emit({ type: "bridge_complete" });
     ctx.shutdown();
   });
 }

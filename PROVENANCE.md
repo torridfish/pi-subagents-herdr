@@ -20,7 +20,8 @@
 - Repository: https://github.com/G36maid/pi-interactive-subagents
 - Reviewed commit: `b0227d4018d458c0e578f73b3de6c3b588c4b1b4`
 - Reference project license: MIT.
-- Consulted for its `ask_question` tool while building `caller_ping`. Nothing was transplanted: it parks a live tmux pane and steers the answer into the running child, where this repository exits the child and resumes it from its session file, because the process backend has no live pane to steer. What was taken is its prompt framing — leading with "prefer asking over guessing" rather than with the restrictions — which measurably changes how often a smaller model uses the tool at all (`test/eval-ping.ts`).
+- Consulted for its `ask_question` and `subagent_message` tools while building `caller_ping`. Three of its design decisions were adopted after review, and are better than what they replaced here: a child that asks a question **parks its session rather than exiting**, so a subagent session ends only when its task is done; **one name-addressed message tool** covers answering, steering and picking a finished child back up, rather than a separate resume tool; and the **fully-resolved loadout is snapshotted** so a child restarted later is the same sandbox rather than whatever the config says at the time. Its prompt framing was adopted too — leading with "prefer asking over guessing" rather than with the restrictions — which measurably changes how often a smaller model uses the tool at all (`test/eval-ping.ts`, 1/6 → 5/6).
+- No code was transplanted, and the transports differ: that project is tmux-only and types answers into a live pane, while this one drives a headless child over pi's RPC protocol on the process backend and types into the pane only on the Herdr backend.
 
 ## New implementation
 

@@ -71,7 +71,7 @@ Tool call:
 | researcher | Sourced web research | web_search, fetch_content |
 | worker | Isolated implementation | read, write, edit, safe_bash, web_search, fetch_content |
 
-No bundled agent can delegate: all three are dispatched by the main session and none carries `subagent`. Every Pi child additionally gets `caller_ping`, which no agent declares — see [Pausing to ask](#pausing-to-ask). Include all task context explicitly; conversation history is not copied.
+No bundled agent can delegate: all three are dispatched by the main session and none carries `subagent`. Every Pi child additionally gets `caller_ping`, which no agent declares — see [Asking, and answering](#asking-and-answering). Include all task context explicitly; conversation history is not copied.
 
 The call returns immediately with a handle rather than the answer:
 
@@ -81,31 +81,56 @@ The call returns immediately with a handle rather than the answer:
 
 While it runs, the widget above the editor shows it. When it lands, its report arrives as a `subagent_result` message that wakes the session — there is nothing to wait on or poll.
 
-## Pausing to ask
+## Asking, and answering
 
 Every Pi child gets one tool it never has to declare: `caller_ping`. A child that cannot make progress without a decision its caller owns — an ambiguous requirement, a credential it was not given, a destructive step it should not take unasked — asks for it rather than guessing.
 
-The run then goes **paused**, not finished:
+The run then goes **waiting**, not finished:
 
 ```
 ? scout-1 asks: Should the migration drop the legacy column, or leave it?   1m4s
 ```
 
-The question is steered to the parent as a `subagent_question` message naming the handle. Answering it resumes the same child:
+The child is still there while that line is on screen. **A subagent session ends only when its task is actually done** — a turn that settles with a question outstanding parks the session instead of shutting it down, holding its context, its findings and its place in the work, doing nothing and costing nothing until somebody replies.
+
+The question is steered to the parent as a `subagent_question` message naming the handle, and `subagent_message` answers it:
 
 ```json
-{ "handle": "scout-1", "answer": "Leave it in place; a later migration removes it." }
+{ "handle": "scout-1", "message": "Leave it in place; a later migration removes it." }
 ```
 
-It is one run throughout — same handle, same roster row, one accumulating tool log and usage total, and a single report at the end. A run may pause and continue any number of times. Nothing expires; a paused child costs nothing while it waits, and if the answer is the user's to give, the parent is told to ask them rather than answer on their behalf.
+It is one run throughout — one process, one handle, one roster row, one accumulating tool log and usage total, one report at the end. A run may ask and continue any number of times. If the answer is the user's to give, the parent is told to ask them rather than answer on their behalf.
 
-Mechanically the child **exits and is restarted**, rather than blocking on a channel. It writes the question to a sidecar in its run directory and ends its turn; the parent reads it, keeps the run directory alive, and later relaunches Pi against the child's own session file with the answer as its next prompt. A child waiting on a parent that is itself waiting on a model would be a deadlock with a timeout attached, so there is deliberately no such channel. The run directory is reclaimed when the run finishes, or when the session ends with the question still unanswered — after that nothing can answer it.
+### subagent_message
+
+The same tool covers every way a parent has something more to say, dispatched by what the child is doing:
+
+| Child is | What happens |
+| --- | --- |
+| **waiting** | The answer is delivered and it carries on from where it stopped |
+| **running** | The message is steered into the turn in flight, landing between tool calls — for correcting a child you can see heading the wrong way |
+| **finished** | Its session is started again from the file it wrote, with the message as the next thing it hears. Same context, same loadout, same handle |
+
+Run directories therefore live as long as the Pi session that owns them, not as long as the child: a finished subagent is still addressable, and picking it back up is cheaper than dispatching a fresh one that would have to rediscover everything.
+
+### How a message actually reaches a child
+
+Two transports, because the two backends are different animals, and nothing above this line knows which is in play:
+
+- **Process backend** — the child runs as `pi --mode rpc`, whose stdin is a JSONL command channel and whose stdout is the very same event stream print mode emitted. A message is a `prompt` command when the child is parked and a `steer` command when a turn is in flight; pi rejects the wrong one rather than papering over it, so which is which is tracked.
+- **Herdr backend** — the child is a real interactive Pi in a pane, with no stdin its parent can write to. The message is typed into that pane and submitted, exactly as the human sitting in front of it would (newlines flattened, since the first one would submit the message half-written).
+
+Neither is a blocking channel: the child is never waiting on a synchronous call into the parent, which would be a deadlock with a timeout attached the moment the parent was itself waiting on a model. A parked child is idle, and idle is cheap.
+
+The question itself needs no sidecar file — it *is* the `caller_ping` tool call, and both backends already carry every tool call to the parent.
+
+### Does a child actually ask?
 
 Whether a child *reaches for* the tool is a prompt-surface question, not a plumbing one, so it is measured rather than argued about: `test/eval-ping.ts` gives a child a task it cannot finish honestly without asking, never tells it to ask, and counts. On `vllm/GLM-5.3-Flash-EXL3` the rate went from **1/6 to 5/6** when the guidelines were reordered to lead with "prefer asking over guessing" instead of with the restrictions, and a short delegation note was appended to every child's system prompt (n=6 per arm, Fisher p≈0.08 — a direction, not a proof). The same lesson `buildPromptSurface` already records for `subagent` itself: a tool introduced by its restrictions is a tool a smaller model never picks up.
 
 A child that does not ask simply guesses, which is what it did before the feature existed — the floor is the old behaviour, not a worse one.
 
-`caller_ping` is a Pi-runner feature. A `claude` child has no equivalent yet and simply never pauses.
+`caller_ping` is a Pi-runner feature. A `claude` child still runs headless and one-shot: it never asks, and `subagent_message` can only pick it back up after it has finished.
 
 ## Runners
 
@@ -143,7 +168,7 @@ Everything downstream of the child is shared — the in-flight widget, the steer
 
 **Differences worth knowing.** `inherit.skills` maps to `--disable-slash-commands`; `inherit.extensions` has no exact analogue, and setting it to `false` only refuses your MCP servers (`--strict-mcp-config`) — a claude child still reads your `CLAUDE.md`, settings and hooks. Models are given as pi's `provider/model-id`; an `anthropic/` prefix is stripped and a bare alias (`sonnet`) passes through, while a non-Anthropic parent model is dropped so Claude Code picks its own default. `thinking` maps to `--effort`, with `off` floored at `low`. A claude child re-sends its own full system prompt, so a short task costs noticeably more than the same task on a pi child.
 
-Child Pi sessions automatically exit when the task settles. Each keeps a session file inside its own temporary run directory, which exists so a paused child can be resumed with an answer (see [Pausing to ask](#pausing-to-ask)); it is not a persistent handoff session, is never written to your session store, and goes away with the run. Results and live progress remain in the parent's tool transcript. `safe_bash` is a heuristic command filter, **not a security sandbox**; workers have normal file access.
+A Pi child exits when its task is done — not when a turn ends, which is the difference that lets it wait on a question (see [Asking, and answering](#asking-and-answering)). Each keeps a session file and a loadout snapshot in its own temporary run directory, so the same child can be spoken to again later; none of it is written to your session store, and the whole directory goes when the Pi session that owns it ends. Results and live progress remain in the parent's tool transcript. `safe_bash` is a heuristic command filter, **not a security sandbox**; workers have normal file access.
 
 ## Configuration
 

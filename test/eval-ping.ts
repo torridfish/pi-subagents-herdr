@@ -32,30 +32,37 @@ const body = raw.replace(/^---\n[\s\S]*?\n---\n/, "");
 const tools = (/^tools:\s*(.+)$/m.exec(raw)?.[1] ?? "read, grep, find, ls").split(",").map((t) => t.trim());
 const agent: AgentConfig = { name: AGENT, description: "", tools, model, thinking: "low", systemPrompt: body, filePath: file };
 
-/** One child, run to exit. Returns its question, or its final answer. */
+/** One child, run until it asks or finishes. Returns its question, or its answer. */
 async function run(): Promise<{ pinged: boolean; text: string }> {
-  const { args, tempDir, childEnv } = await buildPiArgs(agent, TASK, process.cwd(), DEFAULT_INHERIT);
+  const { args, tempDir, childEnv, rpcPrompt } = await buildPiArgs(agent, TASK, process.cwd(), DEFAULT_INHERIT);
   try {
-    let out = "";
+    let question = "", text = "", buf = "";
     await new Promise<void>((resolve) => {
-      const proc = spawn(args[0], args.slice(1), { cwd: process.cwd(), env: childEnv, stdio: ["ignore", "pipe", "ignore"] });
-      proc.stdout?.on("data", (d: Buffer) => { out += d.toString(); });
+      const proc = spawn(args[0], args.slice(1), { cwd: process.cwd(), env: childEnv, stdio: ["pipe", "pipe", "ignore"] });
+      proc.stdin?.on("error", () => {});
+      const done = () => { proc.kill(); resolve(); };
+      proc.stdout?.on("data", (d: Buffer) => {
+        buf += d.toString();
+        const lines = buf.split("\n");
+        buf = lines.pop() ?? "";
+        for (const line of lines) {
+          let evt: any;
+          try { evt = JSON.parse(line); } catch { continue; }
+          if (evt.type === "tool_execution_start" && evt.toolName === "caller_ping") question = String(evt.args?.question ?? "");
+          if (evt.type === "message_end" && evt.message?.role === "assistant") {
+            const said = (evt.message.content ?? []).filter((c: any) => c.type === "text").map((c: any) => c.text).join("");
+            if (said) text = said;
+          }
+          // A child that asked is parked and will sit there indefinitely: the
+          // measurement is over the moment it does, answered or not.
+          if (evt.type === "agent_settled" && question) done();
+        }
+      });
       proc.on("close", () => resolve());
       proc.on("error", () => resolve());
+      proc.stdin?.write(JSON.stringify({ type: "prompt", message: rpcPrompt }) + "\n");
     });
-    const ping = path.join(tempDir, "ping.json");
-    if (fs.existsSync(ping)) return { pinged: true, text: JSON.parse(fs.readFileSync(ping, "utf-8")).question };
-    // Last assistant text, for eyeballing what it decided instead of asking.
-    let text = "";
-    for (const line of out.split("\n")) {
-      try {
-        const evt = JSON.parse(line);
-        if (evt.type === "message_end" && evt.message?.role === "assistant") {
-          text = (evt.message.content ?? []).filter((c: any) => c.type === "text").map((c: any) => c.text).join("");
-        }
-      } catch { /* non-JSON lines are expected */ }
-    }
-    return { pinged: false, text };
+    return question ? { pinged: true, text: question } : { pinged: false, text };
   } finally {
     fs.rmSync(tempDir, { recursive: true, force: true });
   }

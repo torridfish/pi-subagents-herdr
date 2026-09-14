@@ -2,11 +2,11 @@
 //
 //   PI_TEST_MODEL=provider/model-id npx tsx test/live-ping.ts
 //
-// Checks the pause loop end to end against real Pi: a child that cannot finish
-// without an answer calls `caller_ping`, the run goes paused instead of
-// finishing, and `subagent_resume` puts the same child back to work with the
-// answer — keeping the context it had built. Run it inside Herdr to exercise
-// the pane path (interactive child, sidecar journal) as well as the process one.
+// Checks the waiting loop end to end against real Pi: a child that cannot
+// finish without an answer calls `caller_ping`, its session stays open instead
+// of ending, and `subagent_message` reaches that same live child with the
+// answer. Run it inside Herdr to exercise the pane path (interactive child,
+// sidecar journal, typed-in answer) as well as the process one.
 import assert from "node:assert/strict";
 import extension, { registerAgent } from "../index.ts";
 
@@ -55,28 +55,29 @@ try {
   const handle = ack.details.dispatched;
   const run = ack.details.results[0];
 
-  await until("the child to ask its caller a question", () => run.progress.status === "paused" || run.progress.status === "failed");
-  assert.equal(run.progress.status, "paused", `the run did not pause: ${run.progress.error ?? run.output}`);
-  assert.ok(run.question, "paused with no question");
+  await until("the child to ask its caller a question", () => run.progress.status === "waiting" || run.progress.status === "failed");
+  assert.equal(run.progress.status, "waiting", `the run never waited: ${run.progress.error ?? run.output}`);
+  assert.ok(run.question, "waiting with no question");
+  assert.equal(run.exitCode, -1, "the child exited instead of staying open");
   assert.equal(steers.at(-1)?.customType, "subagent_question");
   const toolsAtPause = run.progress.toolCount, turnsAtPause = run.usage.turns;
-  console.log(`PAUSED ${handle} after ${turnsAtPause} turns: ${JSON.stringify(run.question)}`);
+  console.log(`WAITING ${handle} after ${turnsAtPause} turns: ${JSON.stringify(run.question)}`);
 
-  await tools.get("subagent_resume").execute("live", { handle, answer: ANSWER }, AbortSignal.timeout(600000), undefined, ctx);
-  await until("the resumed child to finish", () => run.progress.status === "completed" || run.progress.status === "failed");
-  assert.equal(run.progress.status, "completed", `the resumed run failed: ${run.progress.error}`);
+  await tools.get("subagent_message").execute("live", { handle, message: ANSWER }, AbortSignal.timeout(600000), undefined, ctx);
+  await until("the answered child to finish", () => run.progress.status === "completed" || run.progress.status === "failed");
+  assert.equal(run.progress.status, "completed", `the answered run failed: ${run.progress.error}`);
 
   // The answer reached the child, and the child that received it is the one
   // that asked — a fresh process would have neither the question nor the task.
   assert.match(run.output, /GREETING:/);
   assert.match(run.output, /BLUEBIRD-42/);
-  assert.ok(run.usage.turns > turnsAtPause, "the resumed leg added no turns");
-  assert.ok(run.progress.toolCount >= toolsAtPause, "the tool log was reset by the resume");
+  assert.ok(run.usage.turns > turnsAtPause, "the answered leg added no turns");
+  assert.ok(run.progress.toolCount >= toolsAtPause, "the tool log was reset by the answer");
   assert.equal(steers.at(-1)?.customType, "subagent_result");
   assert.equal(steers.length, 2, `expected one question and one result, got ${steers.map((s) => s.customType).join(", ")}`);
 
   console.log(`PASS ${handle} model=${run.model} turns=${run.usage.turns} ${JSON.stringify(run.output.slice(0, 120))}`);
-  console.log("PASS: a child can pause on a question, and resume with the answer in the same session");
+  console.log("PASS: a child can wait on a question, and be answered in the same live session");
 } finally {
   for (const fn of handlers.get("session_shutdown") ?? []) await fn();
 }

@@ -27,7 +27,7 @@ test("bridge forwards structured events, guards early settle, and isolates desce
     handlers.get("agent_settled")({}, { shutdown: () => shutdown++ });
     assert.equal(shutdown, 1);
     const events = (await fs.readFile(path.join(directory, "events.jsonl"), "utf8")).trim().split("\n").map(line => JSON.parse(line));
-    assert.deepEqual(events, [{ type: "bridge_ready" }, event, { type: "bridge_complete" }]);
+    assert.deepEqual(events, [{ type: "bridge_ready" }, event, { type: "agent_settled" }, { type: "bridge_complete" }]);
   } finally {
     if (old === undefined) delete process.env.PI_SUBAGENT_RUN_DIR; else process.env.PI_SUBAGENT_RUN_DIR = old;
     delete process.env.PI_SUBAGENT_BRIDGE;
@@ -48,9 +48,14 @@ test("a process-backend child loads the extension without the event bridge", asy
     childBridge({ on: (name: string, fn: any) => handlers.set(name, fn), registerTool() {} } as any);
     handlers.get("session_start")();
     assert.equal(process.env.PI_SUBAGENT_RUN_DIR, undefined);
+    // No journal — its parent reads this child's stdout directly — but the
+    // session still has to end itself, which is the same handler either way.
     assert.equal(handlers.has("message_end"), false, "an unbridged child registered journal handlers");
-    assert.equal(handlers.has("agent_settled"), false);
-    assert.deepEqual(await fs.readdir(directory), []);
+    handlers.get("agent_start")();
+    let shutdown = 0;
+    handlers.get("agent_settled")({}, { shutdown: () => shutdown++ });
+    assert.equal(shutdown, 1);
+    assert.deepEqual(await fs.readdir(directory), [], "an unbridged child wrote to its run directory");
   } finally {
     if (old === undefined) delete process.env.PI_SUBAGENT_RUN_DIR; else process.env.PI_SUBAGENT_RUN_DIR = old;
     await fs.rm(directory, { recursive: true, force: true });
