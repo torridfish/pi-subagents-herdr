@@ -15,6 +15,13 @@
 - Reference project license: MIT.
 - Consulted for Herdr pane execution, explicit-ID/no-focus behavior, and structured child lifecycle concepts. Its async orchestration implementation was not transplanted.
 
+## Second reference project
+
+- Repository: https://github.com/G36maid/pi-interactive-subagents
+- Reviewed commit: `b0227d4018d458c0e578f73b3de6c3b588c4b1b4`
+- Reference project license: MIT.
+- Consulted for its `ask_question` tool while building `caller_ping`. Nothing was transplanted: it parks a live tmux pane and steers the answer into the running child, where this repository exits the child and resumes it from its session file, because the process backend has no live pane to steer. What was taken is its prompt framing — leading with "prefer asking over guessing" rather than with the restrictions — which measurably changes how often a smaller model uses the tool at all (`test/eval-ping.ts`).
+
 ## New implementation
 
 `herdr/` implements a new local socket client, owned master/stack layout management, interactive child event bridge, and runner transport. The layout is inspired by Hyprland's master/stack behavior; no Hyprland source code is included and Hyprland is not a dependency.

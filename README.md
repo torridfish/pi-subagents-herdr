@@ -101,6 +101,10 @@ It is one run throughout — same handle, same roster row, one accumulating tool
 
 Mechanically the child **exits and is restarted**, rather than blocking on a channel. It writes the question to a sidecar in its run directory and ends its turn; the parent reads it, keeps the run directory alive, and later relaunches Pi against the child's own session file with the answer as its next prompt. A child waiting on a parent that is itself waiting on a model would be a deadlock with a timeout attached, so there is deliberately no such channel. The run directory is reclaimed when the run finishes, or when the session ends with the question still unanswered — after that nothing can answer it.
 
+Whether a child *reaches for* the tool is a prompt-surface question, not a plumbing one, so it is measured rather than argued about: `test/eval-ping.ts` gives a child a task it cannot finish honestly without asking, never tells it to ask, and counts. On `vllm/GLM-5.3-Flash-EXL3` the rate went from **1/6 to 5/6** when the guidelines were reordered to lead with "prefer asking over guessing" instead of with the restrictions, and a short delegation note was appended to every child's system prompt (n=6 per arm, Fisher p≈0.08 — a direction, not a proof). The same lesson `buildPromptSurface` already records for `subagent` itself: a tool introduced by its restrictions is a tool a smaller model never picks up.
+
+A child that does not ask simply guesses, which is what it did before the feature existed — the floor is the old behaviour, not a worse one.
+
 `caller_ping` is a Pi-runner feature. A `claude` child has no equivalent yet and simply never pauses.
 
 ## Runners
@@ -208,6 +212,10 @@ PI_TEST_MODEL=provider/model-id CLAUDE_TEST_MODEL=sonnet npx tsx test/live-runne
 # Explicit opt-in: a real Pi child that pauses on a question and is resumed.
 # Run it inside Herdr to exercise the pane path as well as the process one.
 PI_TEST_MODEL=provider/model-id npx tsx test/live-ping.ts
+
+# Explicit opt-in: N real children, measuring how often one asks rather than
+# guesses. An A/B harness for the prompt surface, not a pass/fail test.
+PI_TEST_MODEL=provider/model-id EVAL_N=6 npx tsx test/eval-ping.ts
 ```
 
 The live layout test checks four equal-height children, preserved focus, and rebalancing after middle-pane removal. The live agent test checks actual interactive Pi startup, event bridging, final output, and cleanup. The live runners test dispatches the same task twice through the real `subagent` tool: once with nothing specified, asserting it went to Pi, and once with `runner: "claude"`, asserting a real headless Claude Code child ran it. Both are checked for tool-call bridging, usage accounting and a completed result. The live ping test makes a child ask a question it cannot answer itself, then resumes it with a passphrase and asserts the passphrase comes back in the finished report — which only holds if the same child, with the context it had built, received the answer. Unit tests cover ownership boundaries, cross-process-manager serialization, capacity, argument conversion, shell quoting, runner selection and its precedence, the claude tool mapping, its argv shape, its stream-json event adapter, and the pause loop end to end against a stand-in child.

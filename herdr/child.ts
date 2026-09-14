@@ -27,18 +27,30 @@ export default function (pi: ExtensionAPI) {
     name: "caller_ping",
     label: "Ask caller",
     description:
-      "Ask the agent that dispatched you a question and pause until it answers. "
-      + "Your session ends the moment you call this — everything you have done so far is kept, "
-      + "and you are resumed with the answer delivered as your next message, so ask for exactly "
-      + "what you need and nothing else.",
-    promptSnippet: "Ask your caller a question when you are blocked, then pause for the answer",
+      "Ask the agent that dispatched you a question, and pause until it answers. Use it when the brief "
+      + "is ambiguous, when a choice would materially change what you produce, or when you need something "
+      + "only your caller has — prefer asking over guessing. Your session pauses rather than ends: "
+      + "everything you have done is kept, the answer arrives as your next message, and you carry on from "
+      + "there. One question per call.",
+    promptSnippet:
+      "Ask your caller one clarifying, missing-requirement or decision question instead of guessing, then pause for the answer",
+    // Ordered deliberately: what to use it FOR comes first, what not to use it
+    // for comes last. A tool introduced by its restrictions is a tool a smaller
+    // model never reaches for — the same lesson `buildPromptSurface` records
+    // for `subagent` itself.
     promptGuidelines: [
-      "Use caller_ping only for a genuine blocker: a decision only your caller can make, a "
-      + "credential or path you were not given, or a destructive step you should not take unasked.",
-      "Never use caller_ping for progress reports, to confirm an assumption you could check "
-      + "yourself, or to ask a question the brief already answers — finish the work instead.",
-      "State the question in one self-contained paragraph. Your caller sees the question alone, "
-      + "not your conversation, so include the context and the options you are choosing between.",
+      "Prefer caller_ping over guessing whenever the brief leaves open something that changes what you "
+      + "produce: which of several valid approaches to take, a value or path you were not given, or "
+      + "whether to take a step that cannot be undone.",
+      "Use caller_ping when more than one answer is defensible and the right one depends on what your "
+      + "caller intended — that is a decision to hand back, not one to make on their behalf.",
+      "Put everything you need into one question: your session pauses on the first caller_ping, and a "
+      + "second call in the same turn is refused.",
+      "After calling caller_ping, stop. End your turn without another tool call and without assuming an answer.",
+      "Give the question enough context to be answered on its own — your caller sees the question, not "
+      + "your conversation — and name the options you are choosing between.",
+      "Do not use caller_ping for progress reports, to confirm something you could establish by reading, "
+      + "or to ask what the brief already answers.",
     ],
     parameters: Type.Object({
       question: Type.String({ description: "What you need to know, self-contained. Include the options you are weighing and what you will do with the answer." }),

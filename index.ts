@@ -430,10 +430,17 @@ export async function buildPiArgs(
 	const piBin = resolvePiBinary();
 	const tempDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-sub-"));
 
-	// Write system prompt to temp file
+	// Write system prompt to temp file.
+	//
+	// The delegation note is appended to every agent's own prompt rather than
+	// written into the agent files: a third-party agent gets it too, and there is
+	// one place to change it. `caller_ping`'s own guidelines already reach the
+	// child's Guidelines section, but an agent file that says "you are a scout,
+	// report X" and never mentions asking is the stronger instruction of the two
+	// for a smaller model — this is what keeps them from contradicting.
 	const promptPath = path.join(tempDir, "system.md");
 	await withFileMutationQueue(promptPath, async () => {
-		await fs.promises.writeFile(promptPath, agent.systemPrompt, { encoding: "utf-8", mode: 0o600 });
+		await fs.promises.writeFile(promptPath, `${agent.systemPrompt}\n\n${DELEGATION_NOTE}`, { encoding: "utf-8", mode: 0o600 });
 	});
 
 	// A child keeps its conversation in its own run directory rather than in the
@@ -531,6 +538,21 @@ function extractTextFromContent(content: unknown): string {
 	}
 	return "";
 }
+
+/**
+ * Appended to every pi child's system prompt, under its own agent role.
+ *
+ * Its job is to make the child's situation concrete — somebody dispatched this,
+ * that somebody is still there, and they can answer — because a role prompt
+ * written for autonomous work otherwise reads as "you are on your own".
+ */
+const DELEGATION_NOTE = [
+	"## Your caller",
+	"",
+	"You were dispatched by another agent to do this one task. It cannot see your session and you cannot see its conversation, but it is there while you work and it can answer you.",
+	"",
+	"When the brief does not settle something that changes what you produce — which of several valid approaches to take, a value or path you were not given, whether to take a step that cannot be undone — ask with `caller_ping` rather than picking on their behalf. Your session pauses, the answer arrives as your next message, and you continue with everything you have already done. Ask what you cannot establish yourself; find out the rest by reading.",
+].join("\n");
 
 /** Where a child leaves a question for its caller, inside its run directory. */
 const PING_FILE = "ping.json";
@@ -1136,6 +1158,7 @@ export function buildPromptSurface(registry: AgentConfig[]): { snippet: string; 
 			...registry.flatMap((a) => triggers[a.name] ?? []),
 			"Do the work yourself when you already have the path, need exact file bytes in order to edit, or it is a single lookup — a subagent costs a process start and a fresh system prompt.",
 			"Write `task` as a standalone brief: the goal, the constraints, the paths you already know, and the output shape you want back. A subagent left to infer the context will infer it wrong.",
+			"When a brief leaves a decision that is yours rather than the subagent's — which approach to take, a value you have not settled, anything irreversible — say so in `task`. A child told which decisions are yours asks you about them instead of picking one and building on it.",
 			"Emit several `subagent` calls in one turn for independent investigations; they run concurrently and their reports arrive separately, each waking you as it lands. Plain parallel read/grep/fetch calls already cover simple I/O — don't wrap those in subagents.",
 			"The handle a dispatch returns is an acknowledgement, never an answer. Never summarise, assume or invent what a child found before its report has actually arrived.",
 		],
