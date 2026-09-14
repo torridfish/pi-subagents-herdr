@@ -204,6 +204,13 @@ function loadConfig(): ExtensionConfig {
 // Built-in tools that pi provides natively (no extension needed)
 const BUILTIN_TOOLS = new Set(["read", "write", "edit", "bash", "grep", "find", "ls"]);
 
+/**
+ * Tools the child extension registers in every pi child. They are added to the
+ * allowlist rather than declared per agent, and they are skipped by the
+ * declared-tool checks so an agent file that lists one anyway still loads.
+ */
+const CHILD_TOOLS = new Set(["caller_ping"]);
+
 // Custom tools that require loading an extension into the subagent process
 const EXT_BASE = path.join(process.env.HOME || "~", ".pi", "agent", "extensions");
 const CUSTOM_TOOL_EXTENSIONS: Record<string, string> = {
@@ -398,6 +405,7 @@ export async function buildPiArgs(
 	inherit: Required<InheritConfig>,
 ): Promise<RunnerArgs> {
 	for (const tool of agent.tools) {
+		if (CHILD_TOOLS.has(tool)) continue;
 		if (!BUILTIN_TOOLS.has(tool) && (!CUSTOM_TOOL_EXTENSIONS[tool] || !fs.existsSync(CUSTOM_TOOL_EXTENSIONS[tool]))) {
 			throw new Error(`Agent ${agent.name} requires unavailable tool ${tool}; install its extension or configure toolExtensions`);
 		}
@@ -426,6 +434,7 @@ export async function buildPiArgs(
 	const extensionPaths = new Set<string>();
 
 	for (const tool of agent.tools) {
+		if (CHILD_TOOLS.has(tool)) continue;
 		if (BUILTIN_TOOLS.has(tool)) {
 			allowlist.push(tool);
 		} else if (CUSTOM_TOOL_EXTENSIONS[tool]) {
@@ -435,18 +444,23 @@ export async function buildPiArgs(
 		}
 	}
 
+	// Not something an agent declares. Any child can find itself blocked on a
+	// question only its caller can answer, and an agent file that forgot to list
+	// the tool would fail exactly then — silently, by inventing an answer
+	// instead. It needs no --extension of its own: the child extension added
+	// below registers it.
+	allowlist.push(...CHILD_TOOLS);
+
 	// Isolation of *tools* is the allowlist's job, not `--no-extensions`. Keeping
 	// discovery on lets the child read the user's own Pi configuration; only an
 	// explicit opt-out strips it back to stock Pi plus the declared tools.
 	if (!inherit.extensions) args.push("--no-extensions");
 
-	if (allowlist.length > 0) {
-		// --tools is a unified allowlist that applies to built-in, extension, and custom tools.
-		args.push("--tools", allowlist.join(","));
-	} else {
-		// Agent declared no tools — disable everything.
-		args.push("--no-tools");
-	}
+	// --tools is a unified allowlist that applies to built-in, extension, and
+	// custom tools. It is never empty now, so `--no-tools` is gone: an agent that
+	// declares no tools gets `--tools caller_ping`, which is the same isolation
+	// with the one door out of it left open.
+	args.push("--tools", allowlist.join(","));
 
 	for (const extPath of extensionPaths) {
 		args.push("--extension", extPath);
