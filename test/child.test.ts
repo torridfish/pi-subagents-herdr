@@ -15,7 +15,7 @@ test("bridge forwards structured events, guards early settle, and isolates desce
   const handlers = new Map<string, any>();
   let shutdown = 0;
   try {
-    childBridge({ on: (name: string, fn: any) => handlers.set(name, fn) } as any);
+    childBridge({ on: (name: string, fn: any) => handlers.set(name, fn), registerTool() {} } as any);
     handlers.get("session_start")();
     assert.equal(process.env.PI_SUBAGENT_RUN_DIR, undefined);
     assert.equal(process.env.PI_SUBAGENT_BRIDGE, undefined);
@@ -45,7 +45,7 @@ test("a process-backend child loads the extension without the event bridge", asy
   delete process.env.PI_SUBAGENT_BRIDGE;
   const handlers = new Map<string, any>();
   try {
-    childBridge({ on: (name: string, fn: any) => handlers.set(name, fn) } as any);
+    childBridge({ on: (name: string, fn: any) => handlers.set(name, fn), registerTool() {} } as any);
     handlers.get("session_start")();
     assert.equal(process.env.PI_SUBAGENT_RUN_DIR, undefined);
     assert.equal(handlers.has("message_end"), false, "an unbridged child registered journal handlers");
