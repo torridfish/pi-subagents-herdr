@@ -68,7 +68,10 @@ export interface ToolEvent {
 
 export interface AgentProgress {
 	agent: string;
-	status: "pending" | "running" | "completed" | "failed";
+	/** `paused` means the child asked its caller a question and exited to wait
+	 *  for the answer. It is not a terminal state: the run still holds its
+	 *  session file and resumes into `running`. */
+	status: "pending" | "running" | "paused" | "completed" | "failed";
 	task: string;
 	/**
 	 * Chronological log of tool calls — running and done interleaved. The
@@ -91,6 +94,9 @@ export interface AgentResult {
 	model?: string;
 	contextWindow?: number;
 	usage: { input: number; output: number; cacheRead: number; cacheWrite: number; cost: number; turns: number };
+	/** What the child asked on its way out, while `progress.status` is `paused`.
+	 *  Cleared when the run is resumed. */
+	question?: string;
 }
 
 interface Details {
@@ -117,6 +123,10 @@ interface RunRecord {
 	agent: string;
 	startedAt: number;
 	result: AgentResult;
+	/** The invocation that started it, kept for as long as the record lives: a
+	 *  paused run owns a temp directory — its session file included — that only
+	 *  a resume or the end of the session may reclaim. */
+	prepared: PreparedRun;
 }
 
 /** A built child invocation, plus which runner built it. Produced before the
@@ -516,6 +526,28 @@ function extractTextFromContent(content: unknown): string {
 	return "";
 }
 
+/** Where a child leaves a question for its caller, inside its run directory. */
+const PING_FILE = "ping.json";
+
+/**
+ * Read the question a child left on its way out, if it left one.
+ *
+ * Absent is the normal case — an ordinary run never writes the file — so a
+ * missing or unreadable sidecar is not an error, it just means the run
+ * finished rather than paused.
+ */
+function readPing(tempDir: string): string | undefined {
+	let raw: string;
+	try {
+		raw = fs.readFileSync(path.join(tempDir, PING_FILE), "utf-8");
+	} catch { return undefined; }
+	try {
+		const ping = JSON.parse(raw) as { type?: unknown; question?: unknown };
+		if (ping.type !== "ping" || typeof ping.question !== "string") return undefined;
+		return ping.question.trim() || undefined;
+	} catch { return undefined; }
+}
+
 /**
  * Build a child invocation without starting it.
  *
@@ -572,6 +604,9 @@ async function runSubagent(
 	}, 150);
 
 	let exitCode = 1;
+	// Set when the child left a question behind. It makes this run paused rather
+	// than finished, and its run directory has to survive the cleanup below.
+	let question: string | undefined;
 	try {
 		// Inside the try, not above it: `prepare` created tempDir before this run
 		// was queued, so an abort that lands while it waits for a semaphore slot
@@ -742,12 +777,21 @@ async function runSubagent(
 		if (signal?.aborted) kill();
 		else signal?.addEventListener("abort", kill, { once: true });
 		});
+		// A clean exit is not the same as a finished job: a child that called
+		// `caller_ping` ends its turn normally and leaves the question here. A
+		// failed run's ping is ignored — there is nothing dependable to resume.
+		if (exitCode === 0 && !progress.error) question = readPing(tempDir);
 	} finally {
-		fs.rmSync(tempDir, { recursive: true, force: true });
+		if (!question) fs.rmSync(tempDir, { recursive: true, force: true });
 	}
 
 	result.exitCode = exitCode;
-	progress.status = exitCode === 0 && !progress.error ? "completed" : "failed";
+	if (question) {
+		result.question = question;
+		progress.status = "paused";
+	} else {
+		progress.status = exitCode === 0 && !progress.error ? "completed" : "failed";
+	}
 	progress.durationMs = Date.now() - startTime;
 	if (progress.error) result.output = result.output || `Error: ${progress.error}`;
 
@@ -832,6 +876,7 @@ function renderAgentProgress(
 	const prog = r.progress;
 	const isRunning = prog.status === "running";
 	const isPending = prog.status === "pending";
+	const isPaused = prog.status === "paused";
 	const nested = depth > 0;
 
 	// Indent prefix for nested levels. ANSI escapes are zero-width so this works
@@ -859,9 +904,11 @@ function renderAgentProgress(
 		? theme.fg("warning", "⟳")
 		: isPending
 			? theme.fg("dim", "○")
-			: r.exitCode === 0
-				? theme.fg("success", "✓")
-				: theme.fg("error", "✗");
+			: isPaused
+				? theme.fg("warning", "?")
+				: r.exitCode === 0
+					? theme.fg("success", "✓")
+					: theme.fg("error", "✗");
 	const stats = `${prog.toolCount} tools · ${formatDuration(prog.durationMs)}`;
 	const modelStr = r.model ? theme.fg("dim", ` (${r.model})`) : "";
 	addLine(`${icon} ${theme.fg("toolTitle", theme.bold(r.agent))}${modelStr} — ${theme.fg("dim", stats)}`);
@@ -912,9 +959,17 @@ function renderAgentProgress(
 		addLine(theme.fg("text", prog.lastMessage));
 	}
 
+	// The question, when the run is paused on one. It is the whole point of the
+	// block at that moment, so it goes last among the prose rows — closest to
+	// wherever the reader's eye lands — and it stays visible when collapsed.
+	if (isPaused && r.question) {
+		if (!nested) c.addChild(new Spacer(1));
+		addLine(theme.fg("warning", `Asks: ${r.question}`));
+	}
+
 	// Expanded final output — only at depth 0. Nested levels are summarized via
 	// their own tool list; the master-level result block is enough context.
-	if (!nested && !isRunning && r.output && expanded) {
+	if (!nested && !isRunning && !isPaused && r.output && expanded) {
 		c.addChild(new Spacer(1));
 		const mdTheme = getMarkdownTheme();
 		c.addChild(new Markdown(r.output, 0, 0, mdTheme));
@@ -965,7 +1020,12 @@ function renderRunsWidget(records: RunRecord[], theme: Theme): Component {
 	return {
 		invalidate() {},
 		render(width: number): string[] {
-			const label = `${records.length} subagent${records.length === 1 ? "" : "s"} running`;
+			// A paused run is still in flight, but calling it "running" would be a
+			// lie about who is waiting for whom: it is waiting for an answer.
+			const waiting = records.filter((r) => r.result.progress.status === "paused").length;
+			const label = waiting === 0
+				? `${records.length} subagent${records.length === 1 ? "" : "s"} running`
+				: `${records.length} subagent${records.length === 1 ? "" : "s"}: ${records.length - waiting} running, ${waiting} waiting on an answer`;
 			const head = `── ${label} `;
 			// Narrower than the label itself: drop the rule and clip, rather than
 			// emitting an over-long line for the TUI to wrap.
@@ -976,15 +1036,19 @@ function renderRunsWidget(records: RunRecord[], theme: Theme): Component {
 			for (const record of records) {
 				const prog = record.result.progress;
 				const queued = prog.status === "pending";
+				const paused = prog.status === "paused";
 				// What the child is doing *now*: its newest still-running tool call,
 				// and only if none is running, its latest prose line. A finished tool
-				// call says nothing about whether the run is still alive.
+				// call says nothing about whether the run is still alive. A paused
+				// run is doing nothing at all — it shows its question instead.
 				const current = [...prog.recentTools].reverse().find((t) => t.status === "running");
-				const activity = queued
-					? "queued"
-					: current
-						? (current.args ? `${current.tool}: ${current.args}` : current.tool)
-						: prog.lastMessage || "thinking…";
+				const activity = paused
+					? `asks: ${record.result.question ?? "a question"}`
+					: queued
+						? "queued"
+						: current
+							? (current.args ? `${current.tool}: ${current.args}` : current.tool)
+							: prog.lastMessage || "thinking…";
 
 				const elapsed = formatDuration(Date.now() - record.startedAt);
 				// icon + space + id + space, then the activity, then the elapsed time
@@ -994,7 +1058,7 @@ function renderRunsWidget(records: RunRecord[], theme: Theme): Component {
 				const body = room > 4 ? truncLine(activity, room) : "";
 				const pad = Math.max(1, width - gutter - visibleWidth(body) - elapsed.length);
 				lines.push(
-					theme.fg(queued ? "dim" : "warning", queued ? "○" : "⟳")
+					theme.fg(queued ? "dim" : "warning", queued ? "○" : paused ? "?" : "⟳")
 					+ " " + theme.fg("accent", record.id)
 					+ " " + theme.fg("muted", body)
 					+ " ".repeat(pad) + theme.fg("dim", elapsed),
@@ -1152,6 +1216,12 @@ export default function (pi: ExtensionAPI) {
 		shutdown.abort();
 		await Promise.allSettled([...running]);
 		stopTicker();
+		// A paused run's directory is exempt from the usual cleanup because it is
+		// waiting to be resumed. Once the session is over nothing can resume it,
+		// so this is where those get reclaimed.
+		for (const record of runs.values()) {
+			if (record.result.progress.status === "paused") fs.rmSync(record.prepared.tempDir, { recursive: true, force: true });
+		}
 		if (ownedLayoutDir) fs.rmSync(ownedLayoutDir, { recursive: true, force: true });
 	});
 	pi.registerCommand("subagents-herdr", {
@@ -1264,7 +1334,7 @@ export default function (pi: ExtensionAPI) {
 				// still queued should not claim to be working.
 				progress: { agent: params.agent, status: "pending" as const, task: params.task, recentTools: [], toolCount: 0, tokens: 0, durationMs: 0, lastMessage: "" },
 			};
-			const record: RunRecord = { id, agent: agent.name, startedAt: Date.now(), result };
+			const record: RunRecord = { id, agent: agent.name, startedAt: Date.now(), result, prepared };
 			runs.set(id, record);
 			updateWidget();
 
@@ -1281,6 +1351,12 @@ export default function (pi: ExtensionAPI) {
 					if (result.exitCode === -1) result.exitCode = 1;
 					result.progress.status = "failed";
 					result.progress.error ||= error instanceof Error ? error.message : String(error);
+				}
+				// A paused run keeps its place in the roster and its run directory: it
+				// has not finished, it is waiting for an answer.
+				if (result.progress.status === "paused") {
+					updateWidget();
+					return;
 				}
 				runs.delete(id);
 				updateWidget();
