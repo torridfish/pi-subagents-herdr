@@ -18,6 +18,7 @@ The first child splits **right** of the caller. Subsequent children append **dow
 - Keeps upstream's `subagent({ agent, task, cwd? })`, isolated contexts, and per-process concurrency limit.
 - Real interactive Pi TUI in every child pane; structured event sidecars return results to the parent. No screen scraping or duplicate model runs.
 - **Asynchronous dispatch**: `subagent` returns a handle (`scout-1`) as soon as the child starts, so the parent session stays interactive while children run. Each finished run is steered back as its own message, which wakes the parent and starts a turn. Results arrive independently, in whatever order they finish.
+- **Children can ask**: a child that hits a decision only its caller can make calls `caller_ping` instead of guessing. Its run goes *paused* rather than finished, holding its session; `subagent_resume(handle, answer)` puts the same child back to work from exactly where it stopped.
 - A pinned widget above the editor lists every run still in flight, with its current tool call and elapsed time. The full progress block — tool log, prose, usage, context gauge, `Ctrl+O` — renders on the steered result message when the run lands.
 - Never focuses a child, creates another tab/workspace, or rearranges unrelated existing panes. A pre-existing multipane tab uses the caller's region, not the entire tab.
 - **Flat topology**: no bundled agent carries the `subagent` tool, so every child is dispatched by the main session. The nesting machinery (`subagent_agents`, `PI_SUBAGENT_ALLOWED`, the cross-process layout lock) is still in place and dormant — granting `subagent` in an agent's frontmatter turns it back on, but a child that dispatches asynchronously and then settles will shut down before its own children finish.
@@ -70,7 +71,7 @@ Tool call:
 | researcher | Sourced web research | web_search, fetch_content |
 | worker | Isolated implementation | read, write, edit, safe_bash, web_search, fetch_content |
 
-No bundled agent can delegate: all three are dispatched by the main session and none carries `subagent`. Include all task context explicitly; conversation history is not copied.
+No bundled agent can delegate: all three are dispatched by the main session and none carries `subagent`. Every Pi child additionally gets `caller_ping`, which no agent declares — see [Pausing to ask](#pausing-to-ask). Include all task context explicitly; conversation history is not copied.
 
 The call returns immediately with a handle rather than the answer:
 
@@ -79,6 +80,28 @@ The call returns immediately with a handle rather than the answer:
 ```
 
 While it runs, the widget above the editor shows it. When it lands, its report arrives as a `subagent_result` message that wakes the session — there is nothing to wait on or poll.
+
+## Pausing to ask
+
+Every Pi child gets one tool it never has to declare: `caller_ping`. A child that cannot make progress without a decision its caller owns — an ambiguous requirement, a credential it was not given, a destructive step it should not take unasked — asks for it rather than guessing.
+
+The run then goes **paused**, not finished:
+
+```
+? scout-1 asks: Should the migration drop the legacy column, or leave it?   1m4s
+```
+
+The question is steered to the parent as a `subagent_question` message naming the handle. Answering it resumes the same child:
+
+```json
+{ "handle": "scout-1", "answer": "Leave it in place; a later migration removes it." }
+```
+
+It is one run throughout — same handle, same roster row, one accumulating tool log and usage total, and a single report at the end. A run may pause and continue any number of times. Nothing expires; a paused child costs nothing while it waits, and if the answer is the user's to give, the parent is told to ask them rather than answer on their behalf.
+
+Mechanically the child **exits and is restarted**, rather than blocking on a channel. It writes the question to a sidecar in its run directory and ends its turn; the parent reads it, keeps the run directory alive, and later relaunches Pi against the child's own session file with the answer as its next prompt. A child waiting on a parent that is itself waiting on a model would be a deadlock with a timeout attached, so there is deliberately no such channel. The run directory is reclaimed when the run finishes, or when the session ends with the question still unanswered — after that nothing can answer it.
+
+`caller_ping` is a Pi-runner feature. A `claude` child has no equivalent yet and simply never pauses.
 
 ## Runners
 
@@ -116,7 +139,7 @@ Everything downstream of the child is shared — the in-flight widget, the steer
 
 **Differences worth knowing.** `inherit.skills` maps to `--disable-slash-commands`; `inherit.extensions` has no exact analogue, and setting it to `false` only refuses your MCP servers (`--strict-mcp-config`) — a claude child still reads your `CLAUDE.md`, settings and hooks. Models are given as pi's `provider/model-id`; an `anthropic/` prefix is stripped and a bare alias (`sonnet`) passes through, while a non-Anthropic parent model is dropped so Claude Code picks its own default. `thinking` maps to `--effort`, with `off` floored at `low`. A claude child re-sends its own full system prompt, so a short task costs noticeably more than the same task on a pi child.
 
-Child Pi sessions automatically exit when the task settles; these are not persistent handoff/resume sessions. Results and live progress remain in the parent's tool transcript. `safe_bash` is a heuristic command filter, **not a security sandbox**; workers have normal file access.
+Child Pi sessions automatically exit when the task settles. Each keeps a session file inside its own temporary run directory, which exists so a paused child can be resumed with an answer (see [Pausing to ask](#pausing-to-ask)); it is not a persistent handoff session, is never written to your session store, and goes away with the run. Results and live progress remain in the parent's tool transcript. `safe_bash` is a heuristic command filter, **not a security sandbox**; workers have normal file access.
 
 ## Configuration
 
@@ -181,9 +204,13 @@ PI_TEST_MODEL=provider/model-id PI_TEST_NESTED=1 \
 # Explicit opt-in: runs a real Pi child AND a real Claude Code child (read-only
 # scouts), and incurs usage on both.
 PI_TEST_MODEL=provider/model-id CLAUDE_TEST_MODEL=sonnet npx tsx test/live-runners.ts
+
+# Explicit opt-in: a real Pi child that pauses on a question and is resumed.
+# Run it inside Herdr to exercise the pane path as well as the process one.
+PI_TEST_MODEL=provider/model-id npx tsx test/live-ping.ts
 ```
 
-The live layout test checks four equal-height children, preserved focus, and rebalancing after middle-pane removal. The live agent test checks actual interactive Pi startup, event bridging, final output, and cleanup. The live runners test dispatches the same task twice through the real `subagent` tool: once with nothing specified, asserting it went to Pi, and once with `runner: "claude"`, asserting a real headless Claude Code child ran it. Both are checked for tool-call bridging, usage accounting and a completed result. Unit tests cover ownership boundaries, cross-process-manager serialization, capacity, argument conversion, shell quoting, runner selection and its precedence, the claude tool mapping, its argv shape, and its stream-json event adapter.
+The live layout test checks four equal-height children, preserved focus, and rebalancing after middle-pane removal. The live agent test checks actual interactive Pi startup, event bridging, final output, and cleanup. The live runners test dispatches the same task twice through the real `subagent` tool: once with nothing specified, asserting it went to Pi, and once with `runner: "claude"`, asserting a real headless Claude Code child ran it. Both are checked for tool-call bridging, usage accounting and a completed result. The live ping test makes a child ask a question it cannot answer itself, then resumes it with a passphrase and asserts the passphrase comes back in the finished report — which only holds if the same child, with the context it had built, received the answer. Unit tests cover ownership boundaries, cross-process-manager serialization, capacity, argument conversion, shell quoting, runner selection and its precedence, the claude tool mapping, its argv shape, its stream-json event adapter, and the pause loop end to end against a stand-in child.
 
 Herdr configuration and server versions are never modified. API calls are bounded by a timeout. Temporary task/event/environment files are private (directory 0700, files 0600) and removed after completion. Abrupt parent death can leave its temporary files and shell pane behind; the heartbeat stops the child process, but does not delete state owned by a dead parent.
 
