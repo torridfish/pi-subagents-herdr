@@ -46,7 +46,7 @@ Researcher/worker require **pi-web-access**, which supplies `web_search` and `fe
 pi install npm:pi-web-access
 ```
 
-Loaded custom tools are resolved from Pi's `sourceInfo.path`, then passed explicitly to children with `--no-extensions` and a tool allowlist. No developer-specific extension paths are required. Missing declared tools cause an actionable error before launching.
+Children inherit your own Pi setup: extension discovery stays on, so they read the same `settings.json`, the same `web-search.json`, and load the same renderers, themes and commands you use in the parent. Tool access is still pinned by Pi's `--tools` allowlist, which applies to built-in, extension and custom tools alike — inheriting your extensions does not let an agent call anything it did not declare. Tools whose extension the child cannot rediscover (this repo's `safe_bash`, anything pinned via `toolExtensions`) are resolved from Pi's `sourceInfo.path` and passed with `--extension`. Missing declared tools cause an actionable error before launching. Set `inherit.extensions` to `false` for the old stock-Pi isolation.
 
 ## Usage
 
@@ -81,7 +81,8 @@ Copy `config.json.example` to `config.json` beside `index.ts` (gitignored):
   "masterRatio": 0.6,
   "minPaneRows": 8,
   "models": {},
-  "toolExtensions": {}
+  "toolExtensions": {},
+  "inherit": { "extensions": true, "skills": false }
 }
 ```
 
@@ -90,7 +91,9 @@ Copy `config.json.example` to `config.json` beside `index.ts` (gitignored):
 - `maxConcurrency`: positive integer, per parent process, default 4.
 - `minPaneRows`: minimum rows per child, default 8. If the shared stack is full, the next call fails with a capacity message rather than creating an unreadable pane. Nested agents count toward this geometry limit, but have their own execution semaphore.
 - `models`: agent name → exact `provider/model-id`; `default` is an optional fallback. Precedence: per-agent config → default config → agent frontmatter → parent model. Bundled agents inherit the parent's current model; no Anthropic credentials are assumed.
-- `toolExtensions`: optional tool name → absolute extension file path; overrides automatic discovery.
+- `toolExtensions`: optional tool name → absolute extension file path; overrides automatic discovery. A pinned tool is always handed to the child explicitly.
+- `inherit.extensions`: load your installed Pi packages in children, default `true`. `false` restores the previous `--no-extensions` isolation, where a child runs stock Pi plus only the extensions backing its declared tools — and therefore ignores whatever those packages read from your configuration.
+- `inherit.skills`: load your skills in children, default `false`. Skills cost context in every child and any tool one registers is filtered out by the allowlist anyway, so turn this on only for an agent that declares that tool.
 
 Session-only backend selection:
 

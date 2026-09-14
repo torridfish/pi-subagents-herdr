@@ -4,5 +4,6 @@
   "masterRatio": 0.6,
   "minPaneRows": 8,
   "models": {},
-  "toolExtensions": {}
+  "toolExtensions": {},
+  "inherit": { "extensions": true, "skills": false }
 }

@@ -98,6 +98,39 @@ interface ExtensionConfig {
 	minPaneRows?: number;
 	models?: Record<string, string>;
 	toolExtensions?: Record<string, string>;
+	inherit?: InheritConfig;
+}
+
+/**
+ * Which parts of the user's own Pi setup a child session keeps.
+ *
+ * Tool access is pinned by `--tools` regardless of these: Pi's allowlist applies
+ * to built-in, extension and custom tools alike, so inheriting the user's
+ * extensions does NOT widen what an agent may call. What it restores is
+ * everything else the user configured — web-search settings and its providers,
+ * renderers, themes, footers, slash commands — which `--no-extensions` had been
+ * stripping, leaving children running stock Pi.
+ */
+export interface InheritConfig {
+	/** Load the user's installed Pi packages in children. Default true. */
+	extensions?: boolean;
+	/** Load the user's skills in children. Default false: any tool a skill
+	 *  registers is filtered out by the allowlist anyway, so they are usually
+	 *  just context weight. */
+	skills?: boolean;
+}
+
+export const DEFAULT_INHERIT: Required<InheritConfig> = { extensions: true, skills: false };
+
+function resolveInherit(config: ExtensionConfig): Required<InheritConfig> {
+	const inherit = config.inherit ?? {};
+	for (const key of Object.keys(inherit)) {
+		if (!(key in DEFAULT_INHERIT)) throw new Error(`Unknown inherit key: ${key}`);
+	}
+	for (const [key, value] of Object.entries(inherit)) {
+		if (value !== undefined && typeof value !== "boolean") throw new Error(`inherit.${key} must be a boolean`);
+	}
+	return { ...DEFAULT_INHERIT, ...inherit };
 }
 
 const EXT_DIR = path.dirname(fileURLToPath(import.meta.url));
@@ -135,6 +168,17 @@ const CUSTOM_TOOL_EXTENSIONS: Record<string, string> = {
 	// PI_SUBAGENT_ALLOWED is set) only registers the allowlisted agents.
 	subagent: path.join(EXT_DIR, "index.ts"),
 };
+
+/**
+ * Tool names whose extension this process found through Pi's own package
+ * discovery (as opposed to the hardcoded map or `toolExtensions`). When a child
+ * inherits extensions it runs the same discovery over the same settings.json,
+ * so it loads these itself — passing `--extension` for them as well would load
+ * the same file twice and re-register its tools.
+ */
+const DISCOVERED_TOOL_EXTENSIONS = new Set<string>(
+	(process.env.PI_SUBAGENT_DISCOVERED_TOOLS || "").split(",").map((s) => s.trim()).filter(Boolean),
+);
 
 // ── Agent Discovery & Registration ────────────────────────────────────
 
@@ -292,10 +336,12 @@ function truncLine(text: string, maxWidth: number): string {
 
 // ── Subagent Execution ────────────────────────────────────────────────
 
-async function buildPiArgs(
+/** Exported for tests: the child command line is the contract this extension keeps. */
+export async function buildPiArgs(
 	agent: AgentConfig,
 	task: string,
 	cwd: string,
+	inherit: Required<InheritConfig>,
 ): Promise<{ args: string[]; tempDir: string; childEnv: NodeJS.ProcessEnv | undefined }> {
 	for (const tool of agent.tools) {
 		if (!BUILTIN_TOOLS.has(tool) && (!CUSTOM_TOOL_EXTENSIONS[tool] || !fs.existsSync(CUSTOM_TOOL_EXTENSIONS[tool]))) {
@@ -311,7 +357,8 @@ async function buildPiArgs(
 		await fs.promises.writeFile(promptPath, agent.systemPrompt, { encoding: "utf-8", mode: 0o600 });
 	});
 
-	const args = [...piBin.baseArgs, "--mode", "json", "-p", "--no-session", "--no-skills"];
+	const args = [...piBin.baseArgs, "--mode", "json", "-p", "--no-session"];
+	if (!inherit.skills) args.push("--no-skills");
 
 	// Separate builtin tools from custom tools. Both kinds share the same
 	// --tools allowlist in pi; --no-tools would disable extension tools too.
@@ -323,12 +370,15 @@ async function buildPiArgs(
 			allowlist.push(tool);
 		} else if (CUSTOM_TOOL_EXTENSIONS[tool]) {
 			allowlist.push(tool);
-			extensionPaths.add(CUSTOM_TOOL_EXTENSIONS[tool]);
+			// Under inherited discovery the child loads this package itself.
+			if (!(inherit.extensions && DISCOVERED_TOOL_EXTENSIONS.has(tool))) extensionPaths.add(CUSTOM_TOOL_EXTENSIONS[tool]);
 		}
 	}
 
-	// Use --no-extensions then add only what we need
-	args.push("--no-extensions");
+	// Isolation of *tools* is the allowlist's job, not `--no-extensions`. Keeping
+	// discovery on lets the child read the user's own Pi configuration; only an
+	// explicit opt-out strips it back to stock Pi plus the declared tools.
+	if (!inherit.extensions) args.push("--no-extensions");
 
 	if (allowlist.length > 0) {
 		// --tools is a unified allowlist that applies to built-in, extension, and custom tools.
@@ -363,9 +413,9 @@ async function buildPiArgs(
 	// extension and filters its agent registry before exposing tool descriptions
 	// to the LLM — so the child literally cannot request an agent outside the
 	// allowlist (the name isn't in its prompt).
-	let childEnv: NodeJS.ProcessEnv | undefined;
+	let childEnv: NodeJS.ProcessEnv = { ...process.env, PI_SUBAGENT_DISCOVERED_TOOLS: [...DISCOVERED_TOOL_EXTENSIONS].join(",") };
 	if (agent.tools.includes("subagent") && agent.subagentAgents !== undefined) {
-		childEnv = { ...process.env, PI_SUBAGENT_ALLOWED: agent.subagentAgents.join(",") };
+		childEnv.PI_SUBAGENT_ALLOWED = agent.subagentAgents.join(",");
 	}
 
 	return { args: [piBin.command, ...args], tempDir, childEnv };
@@ -419,11 +469,12 @@ async function runSubagent(
 	task: string,
 	cwd: string,
 	signal: AbortSignal | undefined,
+	inherit: Required<InheritConfig>,
 	onUpdate?: (progress: AgentProgress, usage: AgentResult["usage"]) => void,
 	layout?: MasterLayout,
 ): Promise<AgentResult> {
 	signal?.throwIfAborted();
-	const { args, tempDir, childEnv } = await buildPiArgs(agent, task, cwd);
+	const { args, tempDir, childEnv } = await buildPiArgs(agent, task, cwd, inherit);
 	const command = args[0];
 	const spawnArgs = args.slice(1);
 
@@ -829,6 +880,7 @@ export default function (pi: ExtensionAPI) {
 	if (!Number.isInteger(concurrency) || concurrency < 1) throw new Error("maxConcurrency must be a positive integer");
 	if (config.masterRatio !== undefined && (!Number.isFinite(config.masterRatio) || config.masterRatio < 0.2 || config.masterRatio > 0.8)) throw new Error("masterRatio must be between 0.2 and 0.8");
 	if (config.minPaneRows !== undefined && (!Number.isInteger(config.minPaneRows) || config.minPaneRows < 3)) throw new Error("minPaneRows must be an integer >= 3");
+	const inherit = resolveInherit(config);
 	const semaphore = new Semaphore(concurrency);
 	let backend = (process.env.PI_SUBAGENT_BACKEND ?? config.backend ?? "auto") as "auto" | "herdr" | "process";
 	if (!["auto", "herdr", "process"].includes(backend)) throw new Error("Invalid subagent backend");
@@ -894,8 +946,15 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			for (const tool of pi.getAllTools()) {
-				if (tool.sourceInfo.source !== "builtin" && fs.existsSync(tool.sourceInfo.path)) CUSTOM_TOOL_EXTENSIONS[tool.name] = tool.sourceInfo.path;
+				if (tool.sourceInfo.source === "builtin" || !fs.existsSync(tool.sourceInfo.path)) continue;
+				CUSTOM_TOOL_EXTENSIONS[tool.name] = tool.sourceInfo.path;
+				// "cli" means this very process was handed the file with `--extension`;
+				// discovery would not find it again, so a child still needs it passed.
+				if (tool.sourceInfo.source === "cli") DISCOVERED_TOOL_EXTENSIONS.delete(tool.name);
+				else DISCOVERED_TOOL_EXTENSIONS.add(tool.name);
 			}
+			// A pinned path is loaded explicitly, so it is no longer discovery's job.
+			for (const tool of Object.keys(config.toolExtensions ?? {})) DISCOVERED_TOOL_EXTENSIONS.delete(tool);
 			Object.assign(CUSTOM_TOOL_EXTENSIONS, config.toolExtensions);
 			const useHerdr = backend === "herdr" || (backend === "auto" && process.env.HERDR_ENV === "1");
 			if (useHerdr && !layout) {
@@ -919,7 +978,7 @@ export default function (pi: ExtensionAPI) {
 			};
 
 			const work = semaphore.run(() =>
-				runSubagent(agent, params.task!, path.resolve(cwd, params.cwd ?? cwd), effectiveSignal, (progress, usage) => {
+				runSubagent(agent, params.task!, path.resolve(cwd, params.cwd ?? cwd), effectiveSignal, inherit, (progress, usage) => {
 					liveResult.progress = progress;
 					liveResult.usage = { ...usage };
 					onUpdate?.({
