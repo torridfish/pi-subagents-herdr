@@ -20,7 +20,7 @@ The first child splits **right** of the caller. Subsequent children append **dow
 - **Asynchronous dispatch**: `subagent` returns a handle (`scout-1`) as soon as the child starts, so the parent session stays interactive while children run. Each finished run is steered back as its own message, which wakes the parent and starts a turn. Results arrive independently, in whatever order they finish.
 - A pinned widget above the editor lists every run still in flight, with its current tool call and elapsed time. The full progress block — tool log, prose, usage, context gauge, `Ctrl+O` — renders on the steered result message when the run lands.
 - Never focuses a child, creates another tab/workspace, or rearranges unrelated existing panes. A pre-existing multipane tab uses the caller's region, not the entire tab.
-- Nested worker → scout/researcher calls inherit a shared, cross-process-locked stack. They do not split their worker into miniature columns.
+- **Flat topology**: no bundled agent carries the `subagent` tool, so every child is dispatched by the main session. The nesting machinery (`subagent_agents`, `PI_SUBAGENT_ALLOWED`, the cross-process layout lock) is still in place and dormant — granting `subagent` in an agent's frontmatter turns it back on, but a child that dispatches asynchronously and then settles will shut down before its own children finish.
 - Parent cancellation/shutdown cleans up owned children. A runner heartbeat terminates a child after loss of its parent. Manual topology changes fail safely instead of rearranging unrelated panes.
 - Outside Herdr, `auto` uses upstream-style headless JSON subprocesses. A Herdr failure is reported, never silently rerun in a second backend.
 - Pluggable **runners**: an agent runs as a Pi child by default, or as a headless Claude Code child (`runner: claude`, process backend only). Both feed the same progress display, concurrency limit and cancellation.
@@ -68,9 +68,9 @@ Tool call:
 |---|---|---|
 | scout | Codebase exploration | read, grep, find, ls |
 | researcher | Sourced web research | web_search, fetch_content |
-| worker | Isolated implementation | read, write, edit, safe_bash, web_search, fetch_content, subagent |
+| worker | Isolated implementation | read, write, edit, safe_bash, web_search, fetch_content |
 
-Worker may spawn only scout/researcher. They cannot delegate further. Include all task context explicitly; conversation history is not copied.
+No bundled agent can delegate: all three are dispatched by the main session and none carries `subagent`. Include all task context explicitly; conversation history is not copied.
 
 The call returns immediately with a handle rather than the answer:
 
