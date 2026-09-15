@@ -1335,7 +1335,7 @@ export function buildPromptSurface(registry: AgentConfig[]): { snippet: string; 
 			"",
 			"The subagent cannot see this conversation. Everything it needs — the goal, the constraints, the file paths you already know, the shape of the answer you want — has to be written into `task`.",
 			"",
-			"A child that gets stuck on something only you can decide can pause and ask, instead of guessing. That arrives as a question naming its handle; answer it with `subagent_resume` and the child carries on from exactly where it stopped.",
+			"A child that gets stuck on something only you can decide can pause and ask, instead of guessing. That arrives as a question naming its handle; answer it with `subagent_message` and the child carries on from exactly where it stopped.",
 		].join("\n"),
 		guidelines: [
 			// Never name an agent that is not registered: a filtered child would
