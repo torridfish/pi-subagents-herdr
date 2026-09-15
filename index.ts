@@ -13,7 +13,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { getMarkdownTheme, parseFrontmatter, truncateHead, withFileMutationQueue, DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES } from "@earendil-works/pi-coding-agent";
-import { type Component, Container, Markdown, Spacer, Text, visibleWidth } from "@earendil-works/pi-tui";
+import { Box, type Component, Container, Markdown, Spacer, Text, visibleWidth } from "@earendil-works/pi-tui";
 import { buildClaudeArgs, makeClaudeLineHandler, type ClaudeRunnerConfig } from "./runners/claude.ts";
 import { extractToolArgsPreview, isRunner, proseSummary, RUNNERS, type RunnerArgs, type RunnerName } from "./runners/shared.ts";
 import { Type } from "typebox";
@@ -1194,34 +1194,30 @@ function renderAgentProgress(
 }
 
 /**
- * Wrap a rendered block in a titled frame.
+ * Draw a run the way pi draws a tool call.
  *
  * A subagent's report arrives as a message in the transcript, where by default
  * it looks exactly like something the main agent said — same column, same
- * colours, no seam. The frame is the seam: everything inside it was written by
- * a different agent in a different context window.
+ * colours, no seam. Tool output already has a seam the reader has learned:
+ * a padded block on a tinted ground. This is that block, assembled the way
+ * pi's own `ToolExecutionComponent` assembles it — a leading blank line, then
+ * a `Box(1, 1)` painted with one of the three tool backgrounds — so a child's
+ * answer reads as machinery reporting rather than as the assistant talking.
  *
- * Drawn rather than delegated to a Box because pi-tui's Box does padding and
- * background, not a border, and a left gutter survives a narrow terminal that a
- * full box would wrap into confetti.
+ * The tone carries the same meaning it does everywhere else in the transcript:
+ * pending while the child waits on an answer, error when it failed, success
+ * when it finished.
  */
-function framed(title: string, inner: Component, theme: Theme): Component {
-	const GUTTER = 2;
-	return {
-		invalidate() { inner.invalidate?.(); },
-		render(width: number): string[] {
-			// Below this there is no room for a gutter and the content both; the
-			// content wins.
-			if (width < 24) return inner.render(width);
-			const head = `${theme.fg("borderMuted", "╭─ ")}${theme.fg("accent", title)} `;
-			const rule = Math.max(0, width - visibleWidth(head));
-			return [
-				head + theme.fg("borderMuted", "─".repeat(rule)),
-				...inner.render(width - GUTTER).map((line) => `${theme.fg("borderMuted", "│")} ${line}`),
-				theme.fg("borderMuted", "╰" + "─".repeat(Math.max(0, width - 1))),
-			];
-		},
-	};
+type ToolTone = "toolPendingBg" | "toolSuccessBg" | "toolErrorBg";
+
+function toolBlock(title: string, inner: Component, theme: Theme, tone: ToolTone): Component {
+	const box = new Box(1, 1, (text) => theme.bg(tone, text));
+	box.addChild(new Text(title, 0, 0));
+	box.addChild(inner);
+	const c = new Container();
+	c.addChild(new Spacer(1));
+	c.addChild(box);
+	return c;
 }
 
 /**
@@ -1497,10 +1493,22 @@ export default function (pi: ExtensionAPI) {
 	const renderSteeredRun = (message: { details?: Details }, options: { expanded: boolean }, theme: Theme) => {
 		const result = message.details?.results?.[0];
 		if (!result) return undefined;
-		// Two columns of frame, then the usual margin the block already assumed.
-		const block = renderAgentProgress(result, theme, options.expanded, getTermWidth() - 6);
+		// One column of box padding each side, then the margin the block already
+		// assumed.
+		const block = renderAgentProgress(result, theme, options.expanded, getTermWidth() - 4);
 		const handle = message.details?.handle;
-		return framed(handle ? `${handle} · ${result.agent}` : result.agent, block, theme);
+		// A run that is waiting has not failed, so it is checked first: its
+		// exit code is the -1 of a child that is still alive.
+		const tone: ToolTone = result.progress.status === "waiting"
+			? "toolPendingBg"
+			: result.exitCode === 0 && !result.progress.error
+				? "toolSuccessBg"
+				: "toolErrorBg";
+		// Titled like the call that dispatched it — `subagent researcher-2` —
+		// because that handle is what `subagent_message` is addressed to. The
+		// agent behind it is named one line below, in the run's own header.
+		const title = `${theme.fg("toolTitle", theme.bold("subagent"))} ${theme.fg("accent", handle ?? result.agent)}`;
+		return toolBlock(title, block, theme, tone);
 	};
 	pi.registerMessageRenderer<Details>("subagent_result", renderSteeredRun);
 	// A pause renders the same way a result does. It is the same run, read at a
