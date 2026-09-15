@@ -10,6 +10,22 @@ export interface PaneLaunch {
   command: string; args: string[]; cwd: string; env: NodeJS.ProcessEnv;
   directory: string; name: string; signal?: AbortSignal;
   onLine: (line: string) => void;
+  /** The pane this child was given, as soon as it exists. A pane child has no
+   *  stdin its parent can write to, so this is the only way to talk to it. */
+  onPane?: (paneId: string) => void;
+}
+
+/**
+ * Type a message to an interactive child and press Enter.
+ *
+ * The same door a human at that pane would use — which is the point: a pane
+ * child is a real Pi session, so it is steered the way one is. Newlines are
+ * flattened because the first one would submit the message half-written.
+ */
+export async function sendToPane(paneId: string, message: string): Promise<void> {
+  const text = message.replace(/\s*\n+\s*/g, " ").trim();
+  if (!text) return;
+  await promisify(execFile)(process.env.HERDR_BIN_PATH || "herdr", ["pane", "run", paneId, text], { timeout: 10000 });
 }
 const here = path.dirname(fileURLToPath(import.meta.url));
 export function shellQuote(value: string): string { return "'" + value.replaceAll("'", "'\\''") + "'"; }
@@ -20,8 +36,9 @@ export function interactiveArgs(args: string[]): string[] {
     if (args[i] === "-p") continue;
     result.push(args[i]);
   }
-  // Options must precede task; Pi also accepts these following its positional prompt.
-  return ["--extension", path.join(here, "child.ts"), ...result];
+  // `child.ts` is not added here: `buildPiArgs` loads it for every pi child, so
+  // a pane child would otherwise be handed the same extension twice.
+  return result;
 }
 
 export async function runInPane(layout: MasterLayout, spec: PaneLaunch): Promise<{ code: number; error?: string }> {
@@ -34,7 +51,13 @@ export async function runInPane(layout: MasterLayout, spec: PaneLaunch): Promise
   }), { mode: 0o600 });
   await fs.writeFile(path.join(spec.directory, "heartbeat"), "", { mode: 0o600 });
   await fs.writeFile(path.join(spec.directory, "events.jsonl"), "", { mode: 0o600 });
+  // A resumed run reuses its directory, so the previous leg's verdict is still
+  // sitting there. Left in place it would be read as this launch's exit before
+  // the pane has even started.
+  await fs.rm(path.join(spec.directory, "exit.json"), { force: true });
+  await fs.rm(path.join(spec.directory, "cancel"), { force: true });
   const pane = await layout.create(spec.name, spec.cwd);
+  spec.onPane?.(pane);
   let offset = 0, pending = "", ready = false, complete = false;
   let cancelledAt = 0;
   const start = Date.now();

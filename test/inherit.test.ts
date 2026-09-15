@@ -13,6 +13,11 @@ const { buildPiArgs, DEFAULT_INHERIT } = await import("../index.ts");
 const EXT_DIR = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const SAFE_BASH = path.join(EXT_DIR, "tools", "safe-bash.ts");
 
+/** The `--tools` allowlist a build produced, as a list. */
+function allowlistOf(args: string[]): string[] {
+  return args[args.indexOf("--tools") + 1].split(",");
+}
+
 async function build(tools: string[], inherit = DEFAULT_INHERIT) {
   const agent = { name: "probe", description: "", tools, model: "test/model", thinking: "medium", systemPrompt: "", filePath: "" };
   const { args, tempDir } = await buildPiArgs(agent, "task", process.cwd(), inherit);
@@ -31,18 +36,35 @@ test("children inherit the user's extensions by default and can be isolated on r
 
 test("inheriting extensions does not widen the tool allowlist", async () => {
   const args = await build(["read", "grep"]);
-  assert.deepEqual(args.slice(args.indexOf("--tools"), args.indexOf("--tools") + 2), ["--tools", "read,grep"]);
+  assert.deepEqual(args.slice(args.indexOf("--tools"), args.indexOf("--tools") + 2), ["--tools", "read,grep,caller_ping"]);
+});
+
+test("every child can reach its caller, whatever its agent file declares", async () => {
+  // Declared or not, exactly once — and an agent that declares it must not be
+  // rejected for naming a tool no extension map knows about.
+  assert.deepEqual(allowlistOf(await build(["read", "caller_ping"])), ["read", "caller_ping"]);
+  // An agent with no tools at all is isolated by an allowlist of one, not by
+  // `--no-tools`, which would take the ping tool down with everything else.
+  const bare = await build([]);
+  assert.equal(bare.includes("--no-tools"), false);
+  assert.deepEqual(allowlistOf(bare), ["caller_ping"]);
 });
 
 test("a tool the child rediscovers is not also passed with --extension", async () => {
+  // Every child is handed the child extension, whatever its tools are; the
+  // counts below are "one for the bridge, plus one per tool we must supply".
+  const CHILD = path.join(EXT_DIR, "herdr", "child.ts");
+  assert.deepEqual((await build(["read"])).filter((a) => a === "--extension").length, 1);
+  assert.ok((await build(["read"])).includes(CHILD));
+
   // `subagent` was seeded as discovered; safe_bash ships in this repo and is not.
   const inherited = await build(["subagent", "safe_bash"]);
-  assert.equal(inherited.filter((a) => a === "--extension").length, 1);
+  assert.equal(inherited.filter((a) => a === "--extension").length, 2);
   assert.ok(inherited.includes(SAFE_BASH));
   assert.ok(!inherited.includes(path.join(EXT_DIR, "index.ts")));
 
   // Without discovery in the child, every declared tool must be handed over.
   const isolated = await build(["subagent", "safe_bash"], { ...DEFAULT_INHERIT, extensions: false });
-  assert.equal(isolated.filter((a) => a === "--extension").length, 2);
+  assert.equal(isolated.filter((a) => a === "--extension").length, 3);
   assert.ok(isolated.includes(path.join(EXT_DIR, "index.ts")));
 });
