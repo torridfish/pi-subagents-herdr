@@ -1,4 +1,5 @@
 import * as fs from "node:fs/promises";
+import { existsSync } from "node:fs";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import * as path from "node:path";
@@ -16,6 +17,27 @@ export interface PaneLaunch {
 }
 
 /**
+ * The `herdr` executable to shell out to.
+ *
+ * Herdr hands every pane a `HERDR_BIN_PATH` taken from its server's own
+ * `/proc/self/exe`. When the binary is replaced in place — any upgrade — Linux
+ * starts reporting that link with a literal `" (deleted)"` suffix, and a server
+ * that has been running across the upgrade passes the suffixed string on to
+ * every pane it opens afterwards. Spawning it fails with ENOENT, which reads
+ * like a broken subagent rather than like a stale server.
+ *
+ * So the suffix is stripped, and a path that still is not there falls back to
+ * whatever `herdr` is on PATH. The fallback is safe precisely because an
+ * upgrade replaces the same path: PATH resolves to the new build. Looked up per
+ * call rather than cached, so a session that outlives an upgrade recovers on
+ * its own.
+ */
+export function herdrBin(): string {
+  const declared = process.env.HERDR_BIN_PATH?.replace(/ \(deleted\)$/, "").trim();
+  return declared && existsSync(declared) ? declared : "herdr";
+}
+
+/**
  * Type a message to an interactive child and press Enter.
  *
  * The same door a human at that pane would use — which is the point: a pane
@@ -25,7 +47,7 @@ export interface PaneLaunch {
 export async function sendToPane(paneId: string, message: string): Promise<void> {
   const text = message.replace(/\s*\n+\s*/g, " ").trim();
   if (!text) return;
-  await promisify(execFile)(process.env.HERDR_BIN_PATH || "herdr", ["pane", "run", paneId, text], { timeout: 10000 });
+  await promisify(execFile)(herdrBin(), ["pane", "run", paneId, text], { timeout: 10000 });
 }
 const here = path.dirname(fileURLToPath(import.meta.url));
 export function shellQuote(value: string): string { return "'" + value.replaceAll("'", "'\\''") + "'"; }
@@ -97,7 +119,7 @@ export async function runInPane(layout: MasterLayout, spec: PaneLaunch): Promise
     await delay(300);
     spec.signal?.throwIfAborted();
     const command = [process.execPath, path.join(here, "runner.mjs"), spec.directory].map(shellQuote).join(" ");
-    await promisify(execFile)(process.env.HERDR_BIN_PATH || "herdr", ["pane", "run", pane, command], { timeout: 10000 });
+    await promisify(execFile)(herdrBin(), ["pane", "run", pane, command], { timeout: 10000 });
     let lastInspection = 0;
     while (true) {
       await readEvents();
