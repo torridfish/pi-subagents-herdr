@@ -15,7 +15,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { getMarkdownTheme, parseFrontmatter, truncateHead, withFileMutationQueue, DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES } from "@earendil-works/pi-coding-agent";
 import { Box, type Component, Container, Markdown, Spacer, Text, visibleWidth } from "@earendil-works/pi-tui";
 import { buildClaudeArgs, makeClaudeLineHandler, type ClaudeRunnerConfig } from "./runners/claude.ts";
-import { extractToolArgsPreview, isRunner, proseSummary, RUNNERS, type RunnerArgs, type RunnerName } from "./runners/shared.ts";
+import { delegationNote, extractToolArgsPreview, isRunner, proseSummary, RUNNERS, type RunnerArgs, type RunnerName } from "./runners/shared.ts";
 import { Type } from "typebox";
 
 // ── Types ──────────────────────────────────────────────────────────────
@@ -176,7 +176,11 @@ interface Loadout {
 	pane: boolean;
 	cwd: string;
 	args: string[];
+	/** Exactly one of these is set, and which one is the runner's business: pi
+	 *  resumes from a session file it was given, claude from an id it was
+	 *  assigned. Either way it is what makes a finished child resumable. */
 	sessionPath?: string;
+	sessionId?: string;
 	env: Record<string, string>;
 }
 
@@ -187,7 +191,7 @@ function writeLoadout(prepared: PreparedRun, agent: AgentConfig, cwd: string, pa
 	}
 	const loadout: Loadout = {
 		version: 1, agent: agent.name, runner: prepared.runner, model: agent.model,
-		pane, cwd, args: prepared.args, sessionPath: prepared.sessionPath, env,
+		pane, cwd, args: prepared.args, sessionPath: prepared.sessionPath, sessionId: prepared.sessionId, env,
 	};
 	fs.writeFileSync(path.join(prepared.tempDir, "loadout.json"), JSON.stringify(loadout, null, 2), { mode: 0o600 });
 }
@@ -514,7 +518,7 @@ export async function buildPiArgs(
 	// for a smaller model — this is what keeps them from contradicting.
 	const promptPath = path.join(tempDir, "system.md");
 	await withFileMutationQueue(promptPath, async () => {
-		await fs.promises.writeFile(promptPath, `${agent.systemPrompt}\n\n${DELEGATION_NOTE}`, { encoding: "utf-8", mode: 0o600 });
+		await fs.promises.writeFile(promptPath, `${agent.systemPrompt}\n\n${delegationNote("caller_ping")}`, { encoding: "utf-8", mode: 0o600 });
 	});
 
 	// A child keeps its conversation in its own run directory rather than in the
@@ -584,9 +588,9 @@ export async function buildPiArgs(
 
 	// An RPC child is handed its task over the wire, where length is not an
 	// issue. Only an argv-carried task needs the file indirection.
-	let rpcPrompt: string | undefined;
+	let openingPrompt: string | undefined;
 	if (!pane) {
-		rpcPrompt = `Task: ${task}`;
+		openingPrompt = `Task: ${task}`;
 	} else if (task.length > TASK_LIMIT) {
 		const taskPath = path.join(tempDir, "task.md");
 		await withFileMutationQueue(taskPath, async () => {
@@ -611,7 +615,8 @@ export async function buildPiArgs(
 		childEnv.PI_SUBAGENT_ALLOWED = agent.subagentAgents.join(",");
 	}
 
-	return { args: [piBin.command, ...args], tempDir, childEnv, sessionPath, rpcPrompt };
+	return { args: [piBin.command, ...args], tempDir, childEnv, sessionPath, openingPrompt,
+		protocol: pane ? undefined : "pi-rpc" };
 }
 
 function extractTextFromContent(content: unknown): string {
@@ -625,21 +630,6 @@ function extractTextFromContent(content: unknown): string {
 	}
 	return "";
 }
-
-/**
- * Appended to every pi child's system prompt, under its own agent role.
- *
- * Its job is to make the child's situation concrete — somebody dispatched this,
- * that somebody is still there, and they can answer — because a role prompt
- * written for autonomous work otherwise reads as "you are on your own".
- */
-const DELEGATION_NOTE = [
-	"## Your caller",
-	"",
-	"You were dispatched by another agent to do this one task. It cannot see your session and you cannot see its conversation, but it is there while you work and it can answer you.",
-	"",
-	"When the brief does not settle something that changes what you produce — which of several valid approaches to take, a value or path you were not given, whether to take a step that cannot be undone — ask with `caller_ping` rather than picking on their behalf. Your session pauses, the answer arrives as your next message, and you continue with everything you have already done. Ask what you cannot establish yourself; find out the rest by reading.",
-].join("\n");
 
 /** Above this many characters a prompt is handed over as a file rather than as
  *  an argument, for the task at dispatch and for the answer on resume alike. */
@@ -690,7 +680,7 @@ async function runSubagent(
 	hooks: RunHooks = {},
 	layout?: MasterLayout,
 ): Promise<AgentResult> {
-	const { runner, args, tempDir, childEnv, stdin, rpcPrompt } = prepared;
+	const { runner, args, tempDir, childEnv, openingPrompt, protocol } = prepared;
 	const onUpdate = hooks.onUpdate;
 	// Defence in depth: execute() already refuses this combination with a better
 	// message, but a pane child has no result channel for a non-pi runner.
@@ -851,8 +841,33 @@ async function runSubagent(
 			onUpdate?.();
 		};
 
+		/** A turn settled with nothing outstanding: the child has said its piece
+		 *  and the run is over. A pi child reaches this state by shutting itself
+		 *  down; a claude child has to be let go, because its stdin is what keeps
+		 *  it alive. Set once the channel exists. */
+		let finish: (() => void) | undefined;
+
 		const processLine = runner === "claude"
-			? makeClaudeLineHandler({ progress, result, fireUpdate, startTime })
+			? makeClaudeLineHandler({
+				progress, result, fireUpdate, startTime,
+				onQuestion: (asked) => { question = asked; },
+				// Same decision the pi path makes on `agent_settled`, in the same
+				// order: park on an unanswered question, otherwise let the child go.
+				onTurnEnd: () => {
+					busy = false;
+					if (question) {
+						if (progress.status !== "waiting") {
+							progress.status = "waiting";
+							result.question = question;
+							progress.durationMs = Date.now() - startTime;
+							onUpdate?.();
+							hooks.onWaiting?.(question);
+						}
+						return;
+					}
+					finish?.();
+				},
+			})
 			: processPiLine;
 
 		if (layout) {
@@ -880,37 +895,54 @@ async function runSubagent(
 		const env = runner === "pi"
 			? { ...childEnv, PI_SUBAGENT_BACKEND: "process", PI_SUBAGENT_TOOL_EXTENSIONS: JSON.stringify(CUSTOM_TOOL_EXTENSIONS) }
 			: childEnv;
-		// stdin is a channel here, not a one-shot argument. The claude runner writes
-		// its task and closes — its variadic `--tools`/`--allowedTools` would
-		// otherwise swallow a trailing positional prompt as one more tool name — and
-		// a pi child over RPC keeps it open for the life of the run, because that is
-		// how an answer reaches it.
-		const wantsStdin = stdin !== undefined || rpcPrompt !== undefined;
-		const proc = spawn(command, spawnArgs, { cwd, stdio: [wantsStdin ? "pipe" : "ignore", "pipe", "pipe"], env });
+		// stdin is a channel, not a one-shot argument: both runners keep it open
+		// for the life of the run, because that is how an answer reaches a parked
+		// child. Only the envelope differs — pi takes RPC commands, Claude Code
+		// takes the same user messages it would take from a terminal.
+		const proc = spawn(command, spawnArgs, { cwd, stdio: [openingPrompt !== undefined ? "pipe" : "ignore", "pipe", "pipe"], env });
 		// A child that exits before reading gives us EPIPE; the close handler
 		// already reports the real failure, so don't let it crash the parent.
 		proc.stdin?.on("error", () => {});
-		if (stdin !== undefined) {
-			proc.stdin?.end(stdin);
-		} else if (rpcPrompt !== undefined) {
-			const send = (cmd: Record<string, unknown>) => {
+		if (openingPrompt !== undefined) {
+			const write = (payload: Record<string, unknown>) => {
 				if (!proc.stdin || proc.stdin.destroyed || proc.exitCode !== null) throw new Error("the child is no longer running");
-				proc.stdin.write(JSON.stringify(cmd) + "\n");
+				proc.stdin.write(JSON.stringify(payload) + "\n");
 			};
 			/**
 			 * Say something to this child.
 			 *
-			 * `steer` lands between the tool calls of a turn already in flight;
-			 * `prompt` starts a fresh turn in a parked session. Pi rejects the wrong
-			 * one of the two rather than papering over it, which is why `busy` is
-			 * tracked at all.
+			 * Over RPC, `steer` lands between the tool calls of a turn already in
+			 * flight and `prompt` starts a fresh turn in a parked session; pi
+			 * rejects the wrong one of the two rather than papering over it, which
+			 * is why `busy` is tracked at all. Claude Code's streaming input has no
+			 * such split — a user message is queued if a turn is running and starts
+			 * one if not — so the same call covers both.
 			 */
+			const say = protocol === "claude-stream"
+				? (message: string) => write({ type: "user", message: { role: "user", content: [{ type: "text", text: message }] } })
+				: (message: string) => write(busy ? { type: "steer", message } : { type: "prompt", message });
+
+			// What the ask tool reads to tell an answered question from an
+			// outstanding one. It runs in its own process with no channel to this
+			// one, so the run directory is the only thing they share.
+			const recordDelivery = () => {
+				if (protocol !== "claude-stream") return;
+				try {
+					fs.appendFileSync(path.join(tempDir, "answers.jsonl"), JSON.stringify({ at: Date.now() }) + "\n", { mode: 0o600 });
+				} catch { /* the refusal check degrades to allowing the ask */ }
+			};
+
 			const deliver: Sender = (message) => {
-				send(busy ? { type: "steer", message } : { type: "prompt", message });
+				recordDelivery();
+				say(message);
 				delivered();
 			};
 			hooks.onSender?.(deliver);
-			send({ type: "prompt", message: rpcPrompt });
+			// A claude child holds the floor until its stdin closes. Nothing else
+			// ends the run: the child cannot shut its own session down the way a pi
+			// child does, so this is the parent's half of the same contract.
+			finish = () => { try { proc.stdin?.end(); } catch { /* already gone */ } };
+			say(openingPrompt);
 		}
 		let closed = false;
 		let killTimer: ReturnType<typeof setTimeout> | undefined;
@@ -1770,7 +1802,14 @@ export default function (pi: ExtensionAPI) {
 			// the second process is the same sandbox as the first.
 			const { tempDir } = record.prepared;
 			const loadout = readLoadout(tempDir);
-			if (!loadout?.sessionPath || !fs.existsSync(loadout.sessionPath)) {
+			// A pi session is a file in the run directory, which the end of the
+			// parent's session reclaims; a claude session is an id in the user's
+			// own store, which outlives us. Both are checked the only way they can
+			// be — the file for its existence, the id for having been recorded.
+			const resumable = loadout?.runner === "claude"
+				? Boolean(loadout.sessionId)
+				: Boolean(loadout?.sessionPath && fs.existsSync(loadout.sessionPath));
+			if (!loadout || !resumable) {
 				throw new Error(`Subagent ${record.id} has finished and its session is gone, so it cannot be picked up again. Dispatch a fresh run with what you have learned.`);
 			}
 			const effectiveSignal = signal ? AbortSignal.any([signal, shutdown.signal]) : shutdown.signal;
@@ -1780,7 +1819,7 @@ export default function (pi: ExtensionAPI) {
 			// second process is the first one's sandbox, not today's config.
 			const body = `Your caller has more for you: ${message}\n\nYou are picking up the session you already did work in. Carry on from there rather than starting over.`;
 			let args = loadout.args;
-			let rpcPrompt: string | undefined;
+			let openingPrompt: string | undefined;
 			if (loadout.pane) {
 				// A pane child takes its prompt in argv, where a long one has to go
 				// through a file, exactly as the original task did.
@@ -1794,9 +1833,15 @@ export default function (pi: ExtensionAPI) {
 				}
 				args = [...loadout.args.slice(0, -1), prompt];
 			} else {
-				rpcPrompt = body;
+				openingPrompt = body;
+				// `--session-id` asks for a new conversation under that id, which the
+				// first launch already created. The second one joins it instead.
+				if (loadout.runner === "claude" && loadout.sessionId) {
+					args = loadout.args.map((arg) => (arg === "--session-id" ? "--resume" : arg));
+				}
 			}
-			record.prepared = { ...record.prepared, args, rpcPrompt, sessionPath: loadout.sessionPath,
+			record.prepared = { ...record.prepared, args, openingPrompt,
+				sessionPath: loadout.sessionPath, sessionId: loadout.sessionId,
 				childEnv: { ...process.env, ...loadout.env } };
 			record.result.question = undefined;
 			record.result.exitCode = -1;

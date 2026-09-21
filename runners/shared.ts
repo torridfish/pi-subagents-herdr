@@ -17,25 +17,33 @@ export function isRunner(value: string): value is RunnerName {
 	return (RUNNERS as string[]).includes(value);
 }
 
-/** What a runner's argv builder returns. `stdin`, when set, is written to the
- *  child and the pipe is closed — the claude runner passes its task that way
- *  because Claude Code's variadic options would otherwise swallow a positional
- *  prompt. `args[0]` is the command; the rest are its arguments. */
+/** What a runner's argv builder returns. `args[0]` is the command; the rest are
+ *  its arguments. */
 export interface RunnerArgs {
 	args: string[];
 	tempDir: string;
 	childEnv: NodeJS.ProcessEnv | undefined;
-	stdin?: string;
-	/** Where this child persists its conversation, when its runner can be resumed
-	 *  from one. Set by the pi runner; a run whose child has already exited is
+	/** Where this child persists its conversation, when its runner resumes from a
+	 *  file. Set by the pi runner; a run whose child has already exited is
 	 *  restarted from this file with the new message as its next prompt. */
 	sessionPath?: string;
-	/** The opening prompt for a child driven over pi's RPC protocol, sent as a
-	 *  `prompt` command once it is up rather than passed as an argument. The
-	 *  pane transport puts the task in argv instead, because an interactive Pi
-	 *  has no stdin to speak to. */
-	rpcPrompt?: string;
+	/** The conversation this child persists under, when its runner resumes by id
+	 *  rather than by path. Set by the claude runner, which is handed the id at
+	 *  launch (`--session-id`) and relaunches with `--resume`. */
+	sessionId?: string;
+	/** The opening prompt for a child driven over a stdin channel, sent once the
+	 *  child is up rather than passed as an argument. The pane transport puts the
+	 *  task in argv instead, because an interactive Pi has no stdin to speak to. */
+	openingPrompt?: string;
+	/** How to speak on that channel. Both protocols are line-delimited JSON over
+	 *  stdin and both keep the child alive between turns, which is what a parked
+	 *  child needs; only the envelope differs. */
+	protocol?: ChannelProtocol;
 }
+
+/** `pi-rpc` is pi's command channel (`--mode rpc`); `claude-stream` is Claude
+ *  Code's streaming input (`--input-format stream-json`). */
+export type ChannelProtocol = "pi-rpc" | "claude-stream";
 
 /** Everything a runner's line handler mutates. The handler is called once per
  *  line of child stdout and returns nothing; progress reaches the UI through
@@ -45,6 +53,13 @@ export interface LineHandlerDeps {
 	result: AgentResult;
 	fireUpdate: () => void;
 	startTime: number;
+	/** The child asked its caller something. Reported as the tool call happens;
+	 *  what makes the run *waiting* is this question still being unanswered when
+	 *  the turn settles. */
+	onQuestion?: (question: string) => void;
+	/** A turn settled. For a child on a stdin channel this is where its fate is
+	 *  decided: park with a question outstanding, or be let go. */
+	onTurnEnd?: () => void;
 }
 
 /** Collapse any whitespace run (incl. newlines) into a single space. Used to
@@ -91,4 +106,25 @@ export function proseSummary(text: string): string {
 		if (!inCodeBlock && line.trim()) proseLines.push(line.trim());
 	}
 	return proseLines.slice(0, 3).join(" ");
+}
+
+/**
+ * Appended to every child's system prompt, under its own agent role.
+ *
+ * Its job is to make the child's situation concrete — somebody dispatched this,
+ * that somebody is still there, and they can answer — because a role prompt
+ * written for autonomous work otherwise reads as "you are on your own".
+ *
+ * The tool is named rather than assumed: the pi runner registers it as
+ * `caller_ping`, while a claude child reaches it through an MCP server and sees
+ * the mangled name its host gives it.
+ */
+export function delegationNote(askTool: string): string {
+	return [
+		"## Your caller",
+		"",
+		"You were dispatched by another agent to do this one task. It cannot see your session and you cannot see its conversation, but it is there while you work and it can answer you.",
+		"",
+		`When the brief does not settle something that changes what you produce — which of several valid approaches to take, a value or path you were not given, whether to take a step that cannot be undone — ask with \`${askTool}\` rather than picking on their behalf. Your session pauses, the answer arrives as your next message, and you continue with everything you have already done. Ask what you cannot establish yourself; find out the rest by reading.`,
+	].join("\n");
 }

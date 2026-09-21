@@ -1,10 +1,17 @@
 /**
- * Claude Code runner — prototype. `process` backend only.
+ * Claude Code runner. `process` backend only.
  *
  * Runs an agent as a headless `claude -p --output-format stream-json` child and
  * adapts its event stream onto the same `AgentProgress`/`AgentResult` shapes the
  * pi runner produces, so the renderer, the concurrency semaphore, cancellation
  * and truncation all work unchanged.
+ *
+ * The child is driven over streaming input (`--input-format stream-json`)
+ * rather than being handed a prompt and left to exit, for the same reason the
+ * pi runner uses `--mode rpc`: a child that asks its caller a question has to
+ * still be there when the answer comes back. Stdin stays open as a message
+ * channel, and the parent — not the child — decides when the run is over, by
+ * closing it once a turn settles with nothing outstanding.
  *
  * Not supported here, deliberately:
  *  - The herdr backend. Pane children report back through `herdr/child.ts`, which
@@ -13,11 +20,21 @@
  *  - Nested delegation. Claude Code's `Task` tool spawns its own agent types, not
  *    the ones registered here, so mapping `subagent` onto it would be a lie.
  */
+import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { fileURLToPath } from "node:url";
 import type { AgentConfig, InheritConfig } from "../index.ts";
-import { extractToolArgsPreview, proseSummary, type LineHandlerDeps, type RunnerArgs } from "./shared.ts";
+import { delegationNote, extractToolArgsPreview, proseSummary, type LineHandlerDeps, type RunnerArgs } from "./shared.ts";
+
+/** The MCP server that carries `caller_ping` into a claude child, and the name
+ *  the child therefore sees the tool under. Claude Code namespaces every MCP
+ *  tool as `mcp__<server>__<tool>`, so the mangled name is what has to appear
+ *  in `--allowedTools` and what the parent matches on in the event stream. */
+const ASK_SERVER = "pi_subagents";
+export const CLAUDE_ASK_TOOL = `mcp__${ASK_SERVER}__caller_ping`;
+const ASK_SERVER_PATH = fileURLToPath(new URL("./claude-ask.mjs", import.meta.url));
 
 export interface ClaudeRunnerConfig {
 	/** Executable to invoke. Default `claude` (resolved on PATH). */
@@ -72,6 +89,7 @@ const DISPLAY_NAMES: Record<string, string> = {
 	Glob: "find",
 	WebSearch: "web_search",
 	WebFetch: "web_fetch",
+	[CLAUDE_ASK_TOOL]: "caller_ping",
 };
 
 /** pi `--thinking` level → Claude Code `--effort` level. Claude Code has no
@@ -119,12 +137,20 @@ export async function buildClaudeArgs(
 	// is identical for both runners.
 	const tempDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "claude-sub-"));
 
+	// The id is assigned rather than read back off the `init` event: a run that
+	// is picked up again resumes by id, and knowing it before the child speaks
+	// means the loadout is complete the moment it is written. Session
+	// persistence is left ON for the same reason — `--no-session-persistence`
+	// would make a finished child unresumable.
+	const sessionId = crypto.randomUUID();
+
 	const args = [
 		config.command ?? "claude",
 		"-p",
+		"--input-format", "stream-json",
 		"--output-format", "stream-json",
 		"--verbose", // stream-json requires it under --print
-		"--no-session-persistence",
+		"--session-id", sessionId,
 	];
 
 	// `--disable-slash-commands` is Claude Code's "no skills". Extension
@@ -132,6 +158,25 @@ export async function buildClaudeArgs(
 	// MCP servers, which is what isolation means for a Claude Code child.
 	if (!inherit.skills) args.push("--disable-slash-commands");
 	if (!inherit.extensions) args.push("--strict-mcp-config");
+
+	// The ask tool, always, exactly as the pi runner always adds `caller_ping`
+	// to its allowlist: any child can find itself blocked on something only its
+	// caller knows, and the one that was configured without a way to ask fails
+	// precisely then — silently, by inventing an answer. `--strict-mcp-config`
+	// above drops the user's own servers but keeps this one, because it is
+	// passed here rather than discovered.
+	args.push("--mcp-config", JSON.stringify({
+		mcpServers: {
+			[ASK_SERVER]: {
+				command: process.execPath,
+				args: [ASK_SERVER_PATH],
+				// The run directory is how the tool tells an answered question from
+				// an outstanding one; it is passed explicitly rather than inherited,
+				// because the child's own PI_SUBAGENT_* variables are stripped below.
+				env: { PI_SUBAGENT_RUN_DIR: tempDir },
+			},
+		},
+	}));
 
 	// Two separate jobs. `--tools` decides which tools EXIST in the child — the
 	// real analogue of pi's `--tools` allowlist. `--allowedTools` pre-approves
@@ -142,28 +187,35 @@ export async function buildClaudeArgs(
 	if (config.permissionMode) args.push("--permission-mode", config.permissionMode);
 	if (tools.length > 0) {
 		args.push("--tools", ...tools);
-		args.push("--allowedTools", ...tools);
 	} else {
 		args.push("--tools", ""); // documented spelling for "no tools at all"
 	}
+	// `--tools` governs the built-in set only, so the ask tool is pre-approved
+	// here and nowhere else — an MCP tool that is not in `--allowedTools` is
+	// denied outright under `--permission-prompts none`.
+	args.push("--allowedTools", ...tools, CLAUDE_ASK_TOOL);
 
 	const model = resolveClaudeModel(agent.model);
 	if (model) args.push("--model", model);
 	const effort = EFFORT_LEVELS[agent.thinking];
 	if (effort) args.push("--effort", effort);
-	if (agent.systemPrompt.trim()) args.push("--append-system-prompt", agent.systemPrompt);
+	// The delegation note goes to every agent, with or without a prompt of its
+	// own: the tool description alone is the weaker of the two instructions for
+	// a smaller model, and an agent file that says "report X" and never mentions
+	// asking is what it would otherwise be read against.
+	const appended = [agent.systemPrompt.trim(), delegationNote(CLAUDE_ASK_TOOL)].filter(Boolean).join("\n\n");
+	args.push("--append-system-prompt", appended);
 	if (config.maxBudgetUsd !== undefined) args.push("--max-budget-usd", String(config.maxBudgetUsd));
 
-	// The task goes in on stdin, not as a positional. `--tools` and
-	// `--allowedTools` are variadic, so a trailing prompt argument would be
-	// parsed as one more tool name and the run would die with "Input must be
-	// provided either through stdin or as a prompt argument".
+	// The task goes in over the stdin channel, not as a positional: `--tools`
+	// and `--allowedTools` are variadic, so a trailing prompt argument would be
+	// parsed as one more tool name.
 	const childEnv: NodeJS.ProcessEnv = { ...process.env };
 	for (const key of Object.keys(childEnv)) {
 		if (key.startsWith("PI_SUBAGENT_")) delete childEnv[key];
 	}
 
-	return { args, tempDir, childEnv, stdin: `Task: ${task}` };
+	return { args, tempDir, childEnv, sessionId, openingPrompt: `Task: ${task}`, protocol: "claude-stream" };
 }
 
 /**
@@ -174,7 +226,7 @@ export async function buildClaudeArgs(
  * matching `tool_result` block inside the following `user` message closes it.
  */
 export function makeClaudeLineHandler(deps: LineHandlerDeps): (line: string) => void {
-	const { progress, result, fireUpdate, startTime } = deps;
+	const { progress, result, fireUpdate, startTime, onQuestion, onTurnEnd } = deps;
 
 	return (line: string) => {
 		if (!line.trim()) return;
@@ -217,6 +269,12 @@ export function makeClaudeLineHandler(deps: LineHandlerDeps): (line: string) => 
 						toolCallId: block.id,
 						status: "running",
 					});
+					// The question is the tool call. The ask tool has no channel back
+					// to us and needs none — every tool call is already on this stream.
+					if (block.name === CLAUDE_ASK_TOOL) {
+						const asked = typeof block.input?.question === "string" ? block.input.question.trim() : "";
+						if (asked) onQuestion?.(asked);
+					}
 				} else if (block.type === "text" && block.text?.trim()) {
 					result.output = block.text;
 					const summary = proseSummary(block.text);
@@ -254,6 +312,9 @@ export function makeClaudeLineHandler(deps: LineHandlerDeps): (line: string) => 
 				progress.lastMessage = `${denied.length} tool call(s) denied: ${denialNames(denied)}`;
 			}
 			fireUpdate();
+			// One `result` per turn, not one per run: the child stays up as long as
+			// its stdin does. Whether this was the last turn is the parent's call.
+			onTurnEnd?.();
 		}
 	};
 }

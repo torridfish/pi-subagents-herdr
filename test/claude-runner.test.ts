@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import type { AgentConfig, AgentProgress, AgentResult } from "../index.ts";
-import { buildClaudeArgs, makeClaudeLineHandler, resolveClaudeModel } from "../runners/claude.ts";
+import { buildClaudeArgs, CLAUDE_ASK_TOOL, makeClaudeLineHandler, resolveClaudeModel } from "../runners/claude.ts";
 import { DEFAULT_INHERIT } from "../index.ts";
 
 const AGENT: AgentConfig = {
@@ -29,8 +29,9 @@ test("declared tools map onto real Claude Code tool names, deduped", async () =>
   const { args } = await build();
   // `find` and `ls` both land on Glob — Claude Code has no LS tool.
   assert.deepEqual(valuesAfter(args, "--tools"), ["Read", "Grep", "Glob"]);
-  // --tools decides what exists; --allowedTools stops a headless child prompting.
-  assert.deepEqual(valuesAfter(args, "--allowedTools"), ["Read", "Grep", "Glob"]);
+  // --tools decides what exists; --allowedTools stops a headless child
+  // prompting, and carries the ask tool, which --tools does not govern.
+  assert.deepEqual(valuesAfter(args, "--allowedTools"), ["Read", "Grep", "Glob", CLAUDE_ASK_TOOL]);
   assert.deepEqual(valuesAfter(args, "--permission-prompts"), ["none"]);
 });
 
@@ -43,16 +44,50 @@ test("tools with no honest equivalent are refused before spawning", async () => 
   assert.deepEqual(valuesAfter((await build({ tools: [] })).args, "--tools"), [""]);
 });
 
-test("the task goes in on stdin, never as a positional argument", async () => {
-  const { args, stdin } = await build();
+test("the task goes in over the stdin channel, never as a positional argument", async () => {
+  const { args, openingPrompt, protocol } = await build();
   // --tools/--allowedTools are variadic: a trailing prompt would be parsed as
   // one more tool name and the run dies with "Input must be provided...".
-  assert.equal(stdin, "Task: do the thing");
+  assert.equal(openingPrompt, "Task: do the thing");
+  assert.equal(protocol, "claude-stream");
   assert.ok(!args.some((a) => a.includes("do the thing")));
-  assert.deepEqual(args.slice(0, 6), ["claude", "-p", "--output-format", "stream-json", "--verbose", "--no-session-persistence"]);
-  assert.deepEqual(valuesAfter(args, "--append-system-prompt"), ["be brief"]);
+  assert.deepEqual(args.slice(0, 7), ["claude", "-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose"]);
   assert.deepEqual(valuesAfter(args, "--model"), ["claude-sonnet-5"]);
   assert.deepEqual(valuesAfter(args, "--effort"), ["medium"]);
+});
+
+// Streaming input is what lets a claude child park on a question instead of
+// exiting, and a persisted session is what lets a finished one be picked back
+// up. `--no-session-persistence` would forfeit the second.
+test("the child is launched on a resumable session it can be relaunched into", async () => {
+  const { args, sessionId } = await build();
+  assert.ok(!args.includes("--no-session-persistence"));
+  assert.match(String(sessionId), /^[0-9a-f-]{36}$/);
+  assert.deepEqual(valuesAfter(args, "--session-id"), [sessionId]);
+});
+
+// The delegation note is the stronger of the two instructions for a smaller
+// model, so it goes to every agent — with or without a prompt of its own.
+test("every agent is told it has a caller, by the name its runner gives the tool", async () => {
+  const withPrompt = valuesAfter((await build()).args, "--append-system-prompt");
+  assert.equal(withPrompt.length, 1);
+  assert.match(withPrompt[0], /^be brief\n\n## Your caller/);
+  assert.ok(withPrompt[0].includes(CLAUDE_ASK_TOOL));
+
+  const bare = valuesAfter((await build({ systemPrompt: "" })).args, "--append-system-prompt");
+  assert.match(bare[0], /^## Your caller/);
+});
+
+// MCP is the only surface a headless claude child loads a tool from, and
+// `--tools` does not govern MCP tools — so the ask tool is allowed by name or
+// it is denied outright under `--permission-prompts none`.
+test("the ask tool is carried in over MCP and pre-approved", async () => {
+  const { args, tempDir } = await build();
+  const config = JSON.parse(valuesAfter(args, "--mcp-config")[0]);
+  const server = config.mcpServers.pi_subagents;
+  assert.ok(server.args[0].endsWith("claude-ask.mjs"));
+  assert.equal(server.env.PI_SUBAGENT_RUN_DIR, tempDir);
+  assert.ok(valuesAfter(args, "--allowedTools").includes(CLAUDE_ASK_TOOL));
 });
 
 test("inheritance flags and runner settings are honoured", async () => {

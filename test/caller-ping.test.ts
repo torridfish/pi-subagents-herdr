@@ -16,7 +16,7 @@ const agent = { name: "probe", description: "", tools: ["read"], model: "test/mo
 // `--no-session` would leave nothing to pick back up, and print mode would exit
 // the moment the first turn settled, question or no question.
 test("a pi child keeps a session file and a command channel", async () => {
-  const { args, tempDir, sessionPath, rpcPrompt } = await buildPiArgs(agent, "task", process.cwd(), DEFAULT_INHERIT);
+  const { args, tempDir, sessionPath, openingPrompt } = await buildPiArgs(agent, "task", process.cwd(), DEFAULT_INHERIT);
   try {
     assert.equal(args.includes("--no-session"), false, "an ephemeral child cannot be picked back up");
     assert.equal(sessionPath, path.join(tempDir, "session.jsonl"));
@@ -29,7 +29,7 @@ test("a pi child keeps a session file and a command channel", async () => {
     assert.equal(args.includes("-p"), false);
     // The task goes over the wire rather than in argv, so nothing has to be
     // written to a file to get past an argument-length limit.
-    assert.equal(rpcPrompt, "Task: task");
+    assert.equal(openingPrompt, "Task: task");
     assert.equal(args.at(-1)?.startsWith("Task:"), false);
   } finally {
     fs.rmSync(tempDir, { recursive: true, force: true });
@@ -39,11 +39,11 @@ test("a pi child keeps a session file and a command channel", async () => {
 // A pane child is a real interactive Pi driven through a terminal, so it takes
 // the opposite shape: no stdin channel, task in argv.
 test("a pane child is built for a terminal instead", async () => {
-  const { args, tempDir, rpcPrompt } = await buildPiArgs(agent, "task", process.cwd(), DEFAULT_INHERIT, true);
+  const { args, tempDir, openingPrompt } = await buildPiArgs(agent, "task", process.cwd(), DEFAULT_INHERIT, true);
   try {
     assert.deepEqual(args.slice(args.indexOf("--mode"), args.indexOf("--mode") + 2), ["--mode", "json"]);
     assert.ok(args.includes("-p"));
-    assert.equal(rpcPrompt, undefined);
+    assert.equal(openingPrompt, undefined);
     assert.equal(args.at(-1), "Task: task");
   } finally {
     fs.rmSync(tempDir, { recursive: true, force: true });
@@ -268,6 +268,134 @@ test("a child that asks a question waits, alive, until it is answered", async ()
     // the test runner itself from exiting.
     await shutdownAll();
     pi.restore();
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+// ── The same loop, under the claude runner ────────────────────────────
+//
+// A stand-in for Claude Code's headless streaming mode: user messages in on
+// stdin as JSON lines, its event stream out on stdout. Its run directory comes
+// from the `--mcp-config` it was handed, because a claude child gets none of
+// the PI_SUBAGENT_* variables a pi child does. First turn it asks and keeps the
+// floor; after that it answers and waits for its stdin to be closed — it has no
+// way to end its own session, which is the whole difference from the pi child
+// above.
+const FAKE_CLAUDE = `
+import fs from "node:fs";
+import path from "node:path";
+const argv = process.argv.slice(2);
+const mcp = JSON.parse(argv[argv.indexOf("--mcp-config") + 1]);
+const dir = mcp.mcpServers.pi_subagents.env.PI_SUBAGENT_RUN_DIR;
+const emit = (event) => process.stdout.write(JSON.stringify(event) + "\\n");
+let buf = "";
+process.stdin.on("end", () => process.exit(0));
+process.stdin.on("data", (chunk) => {
+  buf += chunk;
+  const lines = buf.split("\\n");
+  buf = lines.pop();
+  for (const line of lines) {
+    if (!line.trim()) continue;
+    const command = JSON.parse(line);
+    const text = command.message.content.map((c) => c.text).join("");
+    fs.appendFileSync(process.env.FAKE_CLAUDE_LOG, JSON.stringify({ dir, argv, text }) + "\\n");
+    emit({ type: "system", subtype: "init", model: "claude-sonnet-5" });
+    const asked = path.join(dir, "asked");
+    if (!fs.existsSync(asked)) {
+      fs.writeFileSync(asked, "");
+      emit({ type: "assistant", message: { role: "assistant", content: [
+        { type: "tool_use", id: "t1", name: "mcp__pi_subagents__caller_ping", input: { question: "Postgres or SQLite?" } },
+      ] } });
+      emit({ type: "result", subtype: "success", result: "I need to know which database." });
+      return;                        // still alive, parked on the question
+    }
+    emit({ type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "Done: " + text }] } });
+    emit({ type: "result", subtype: "success", result: "Done: " + text });
+    // No exit: a claude child holds the floor until its caller closes stdin.
+  }
+});
+`;
+
+/** The values a variadic flag was given, in the order argv carries them. */
+function valuesAfter(args: string[], flag: string): string[] {
+  const at = args.indexOf(flag);
+  if (at === -1) return [];
+  const out: string[] = [];
+  for (let i = at + 1; i < args.length && !args[i].startsWith("--"); i++) out.push(args[i]);
+  return out;
+}
+
+/** Put the stand-in on PATH as `claude`, and give it somewhere to report. */
+function stubClaude(directory: string) {
+  const entry = path.join(directory, "fake-claude.mjs");
+  fs.writeFileSync(entry, FAKE_CLAUDE);
+  const shim = path.join(directory, "claude");
+  fs.writeFileSync(shim, `#!/bin/sh\nexec ${process.execPath} ${entry} "$@"\n`, { mode: 0o755 });
+  const oldPath = process.env.PATH, oldLog = process.env.FAKE_CLAUDE_LOG;
+  process.env.PATH = `${directory}:${process.env.PATH}`;
+  process.env.FAKE_CLAUDE_LOG = path.join(directory, "messages.jsonl");
+  fs.writeFileSync(process.env.FAKE_CLAUDE_LOG, "");
+  return {
+    messages: () => fs.readFileSync(path.join(directory, "messages.jsonl"), "utf-8").trim().split("\n").filter(Boolean).map((l) => JSON.parse(l)),
+    restore: () => {
+      process.env.PATH = oldPath;
+      if (oldLog === undefined) delete process.env.FAKE_CLAUDE_LOG; else process.env.FAKE_CLAUDE_LOG = oldLog;
+    },
+  };
+}
+
+test("a claude child asks, parks, and is answered on the same channel", async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "claude-waiting-test-"));
+  const claude = stubClaude(directory);
+  let shutdownAll = async () => {};
+  try {
+    const { tools, handlers, steers, paint } = load();
+    shutdownAll = async () => { await handlers.get("session_shutdown")(); };
+    const ack = await tools.get("subagent").execute("t", { agent: "scout", task: "pick a store", runner: "claude" }, undefined, undefined, ctx);
+    const handle = ack.details.dispatched;
+    const result = ack.details.results[0];
+    await until("the run to start waiting", () => result.progress.status === "waiting");
+
+    // Everything the parent knows about the question it read off the child's
+    // own event stream: the ask tool has no channel back here.
+    assert.equal(result.question, "Postgres or SQLite?");
+    assert.equal(result.exitCode, -1, "a parked run is not a finished one");
+    assert.equal(steers[0].customType, "subagent_question");
+    assert.match(steers[0].content, /Postgres or SQLite\?/);
+    assert.match(paint(), /1 subagent: 0 running, 1 waiting on an answer/);
+
+    await tools.get("subagent_message").execute("m", { handle, message: "Postgres" }, undefined, undefined, ctx);
+    await until("the answered run to finish", () => result.progress.status === "completed");
+
+    const messages = claude.messages();
+    assert.equal(messages.length, 2, "the child was restarted instead of spoken to");
+    assert.equal(messages[0].dir, messages[1].dir, "the second message went to a different child");
+    assert.match(messages[1].text, /Your caller answered: Postgres/);
+    assert.equal(result.output, "Done: " + messages[1].text);
+    assert.equal(steers[1].customType, "subagent_result");
+
+    // The ask tool runs in its own process and cannot see any of this, so the
+    // parent leaves it the one fact it needs: the question has been answered.
+    const answers = fs.readFileSync(path.join(messages[0].dir, "answers.jsonl"), "utf-8").trim().split("\n");
+    assert.equal(answers.length, 1);
+
+    // A claude session is an id in the user's own store rather than a file in
+    // the run directory, and picking the child back up means joining it.
+    const loadout = JSON.parse(fs.readFileSync(path.join(messages[0].dir, "loadout.json"), "utf-8"));
+    assert.equal(loadout.runner, "claude");
+    assert.match(loadout.sessionId, /^[0-9a-f-]{36}$/);
+    assert.equal(loadout.sessionPath, undefined);
+    assert.deepEqual(valuesAfter(messages[0].argv, "--session-id"), [loadout.sessionId]);
+
+    await tools.get("subagent_message").execute("m", { handle, message: "one more thing" }, undefined, undefined, ctx);
+    await until("the follow-up to finish", () => result.progress.status === "completed" && claude.messages().length > 2);
+    const followUp = claude.messages()[2];
+    assert.match(followUp.text, /Your caller has more for you: one more thing/);
+    assert.deepEqual(valuesAfter(followUp.argv, "--resume"), [loadout.sessionId]);
+    assert.ok(!followUp.argv.includes("--session-id"), "a resumed child asked for a new session under the same id");
+  } finally {
+    await shutdownAll();
+    claude.restore();
     fs.rmSync(directory, { recursive: true, force: true });
   }
 });

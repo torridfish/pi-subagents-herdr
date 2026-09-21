@@ -34,7 +34,7 @@ const agent: AgentConfig = { name: AGENT, description: "", tools, model, thinkin
 
 /** One child, run until it asks or finishes. Returns its question, or its answer. */
 async function run(): Promise<{ pinged: boolean; text: string }> {
-  const { args, tempDir, childEnv, rpcPrompt } = await buildPiArgs(agent, TASK, process.cwd(), DEFAULT_INHERIT);
+  const { args, tempDir, childEnv, openingPrompt } = await buildPiArgs(agent, TASK, process.cwd(), DEFAULT_INHERIT);
   try {
     let question = "", text = "", buf = "";
     await new Promise<void>((resolve) => {
@@ -60,7 +60,7 @@ async function run(): Promise<{ pinged: boolean; text: string }> {
       });
       proc.on("close", () => resolve());
       proc.on("error", () => resolve());
-      proc.stdin?.write(JSON.stringify({ type: "prompt", message: rpcPrompt }) + "\n");
+      proc.stdin?.write(JSON.stringify({ type: "prompt", message: openingPrompt }) + "\n");
     });
     return question ? { pinged: true, text: question } : { pinged: false, text };
   } finally {
