@@ -1369,7 +1369,7 @@ export function buildPromptSurface(registry: AgentConfig[]): { snippet: string; 
 			"",
 			"This call is asynchronous. It returns as soon as the child is dispatched, handing you a short handle like `scout-1` — NOT the child's answer. When the child finishes, the harness automatically delivers its report to you as a new message that wakes you up and starts a turn. You do not have to do anything to receive it: there is nothing to poll, no status to check, and no way to wait.",
 			"",
-			"So do not stall on a dispatch. Finish whatever else the current turn needs, and end the turn once nothing is left that does not depend on the answer. If the user is waiting on that answer and nothing else is outstanding, say what you dispatched and stop — you will be woken when it lands.",
+			"So do not stall on a dispatch. Finish whatever else the current turn needs, and end the turn once nothing is left that does not depend on the answer. If the user is waiting on that answer and nothing else is outstanding, say what you dispatched and stop — you will be woken when it lands. Rewriting a brief you have already sent is not \"whatever else the turn needs\": it dispatches a second child, it does not improve the first.",
 			"",
 			"The subagent cannot see this conversation. Everything it needs — the goal, the constraints, the file paths you already know, the shape of the answer you want — has to be written into `task`.",
 			"",
@@ -1381,6 +1381,19 @@ export function buildPromptSurface(registry: AgentConfig[]): { snippet: string; 
 			...registry.flatMap((a) => triggers[a.name] ?? []),
 			"Do the work yourself when you already have the path, need exact file bytes in order to edit, or it is a single lookup — a subagent costs a process start and a fresh system prompt.",
 			"Write `task` as a standalone brief: the goal, the constraints, the paths you already know, and the output shape you want back. A subagent left to infer the context will infer it wrong.",
+			// The child cannot see the conversation, so nothing carries the user's
+			// language across but this. Observed: a Chinese request dispatched as
+			// an English brief, answered in English, translated back by hand.
+			"Write `task` in the language the conversation is in, and say which language the report should come back in. The child cannot see the conversation, so a brief you translated is a report you will have to translate back.",
+			// Observed: the user asked for one runner by name, the dispatch was
+			// refused for an unrelated reason, and the retry dropped the argument.
+			"When the user names a runner, pass it as `runner`. If that dispatch is then refused, say so and let them choose — never re-send with `runner` dropped, which quietly runs their work somewhere they did not ask for.",
+			// Observed: two children given the same question 21 seconds apart,
+			// the second one's brief merely worded better.
+			"A dispatch you have already made is still running. Sending the same brief again does not replace or improve it — you get two children doing one job and two reports. Steer the one you have with `subagent_message` instead.",
+			// The mirror of what every child is told about its caller. The parent
+			// is the one guessing here, and it has somebody to ask too.
+			"Ask the user before dispatching, not after, when the request itself is ambiguous — a term you cannot place, a scope you are guessing at. A child handed a guess comes back confident about the wrong thing, and a whole run is how you find out.",
 			"When a brief leaves a decision that is yours rather than the subagent's — which approach to take, a value you have not settled, anything irreversible — say so in `task`. A child told which decisions are yours asks you about them instead of picking one and building on it.",
 			"Emit several `subagent` calls in one turn for independent investigations; they run concurrently and their reports arrive separately, each waking you as it lands. Plain parallel read/grep/fetch calls already cover simple I/O — don't wrap those in subagents.",
 			"The handle a dispatch returns is an acknowledgement, never an answer. Never summarise, assume or invent what a child found before its report has actually arrived.",
@@ -1601,7 +1614,7 @@ export default function (pi: ExtensionAPI) {
 			agent: Type.String({ description: `Which agent to dispatch: ${agents.map((a) => a.name).join(", ") || "(none registered)"}` }),
 			task: Type.String({ description: "Self-contained brief for the subagent. It shares none of this conversation, so restate the goal, the constraints, any paths you already know, and the output shape you want back." }),
 			cwd: Type.Optional(Type.String({ description: "Working directory for the agent process" })),
-			runner: Type.Optional(Type.String({ description: `Which child process runs the agent: ${RUNNERS.join(" or ")}. Omit unless the user explicitly asked for one — the configured default (normally pi) is right otherwise.` })),
+			runner: Type.Optional(Type.String({ description: `Which child process runs the agent: ${RUNNERS.join(" or ")}. Pass it whenever the user names one, in whatever words and whatever language they used — naming it in passing is still naming it. Omit it only when they did not, and the configured default applies.` })),
 		}),
 
 		// `onUpdate` is unused: streaming partial results into a tool call only
