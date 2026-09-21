@@ -399,3 +399,65 @@ test("a claude child asks, parks, and is answered on the same channel", async ()
     fs.rmSync(directory, { recursive: true, force: true });
   }
 });
+
+// ── Telling a stop from a failure ─────────────────────────────────────
+//
+// A child stops for four reasons and they are not the same news. The two that
+// matter most look identical from inside the child — both arrive as an abort —
+// and the one that matters most of all cannot be seen from here at all: a
+// parent that went away without saying so is reported by the pane watcher,
+// which is the only thing still running to notice.
+test("a run stopped on purpose is not reported as a run that failed", async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "stop-test-"));
+  const pi = stubPi(directory);
+  let shutdownAll = async () => {};
+  try {
+    const { tools, handlers, steers, paint } = load();
+    shutdownAll = async () => { await handlers.get("session_shutdown")(); };
+    const turn = new AbortController();
+    const ack = await tools.get("subagent").execute("t", { agent: "scout", task: "something long" }, turn.signal, undefined, ctx);
+    const result = ack.details.results[0];
+    await until("the run to start waiting", () => result.progress.status === "waiting");
+
+    // The user interrupting the turn is an abort with nobody's reason on it.
+    turn.abort();
+    await until("the stopped run to settle", () => result.progress.status === "failed");
+    assert.equal(result.progress.stoppedBy, "user");
+    assert.match(result.progress.error, /Stopped by the user/);
+    // A settled run leaves the roster, so the mark to check is the one on the
+    // steered result below, not the widget.
+    assert.equal(paint(), "");
+
+    const steer = steers.at(-1);
+    assert.equal(steer.customType, "subagent_result");
+    assert.doesNotMatch(steer.content, /failed/, "a deliberate stop was reported to the model as a failure");
+    assert.match(steer.content, /was stopped after/);
+    // Without this the model's next move is to dispatch the same thing again.
+    assert.match(steer.content, /Do not dispatch it again unless they ask/);
+  } finally {
+    await shutdownAll();
+    pi.restore();
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("the session ending under a run says so, rather than blaming the user", async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "stop-session-test-"));
+  const pi = stubPi(directory);
+  try {
+    const { tools, handlers, steers } = load();
+    const ack = await tools.get("subagent").execute("t", { agent: "scout", task: "something long" }, undefined, undefined, ctx);
+    const result = ack.details.results[0];
+    await until("the run to start waiting", () => result.progress.status === "waiting");
+
+    await handlers.get("session_shutdown")();
+    assert.equal(result.progress.stoppedBy, "session");
+    assert.match(result.progress.error, /the session that dispatched it ended/);
+    // Nobody reads this one — the session is over — but the record is the
+    // record, and a run directory may outlive the process that wrote it.
+    assert.match(steers.at(-1).content, /was stopped after/);
+  } finally {
+    pi.restore();
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});

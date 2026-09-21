@@ -7,6 +7,15 @@ import { fileURLToPath } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
 import { MasterLayout, request } from "./layout.ts";
 
+/** How a pane run ended. `stop` is set only when something put the child down
+ *  rather than letting it finish: `cancelled` is this parent asking, `parent`
+ *  is the pane watcher acting because this parent stopped answering. */
+export interface PaneExit {
+  code: number;
+  error?: string;
+  stop?: "cancelled" | "parent" | "signal";
+}
+
 export interface PaneLaunch {
   command: string; args: string[]; cwd: string; env: NodeJS.ProcessEnv;
   directory: string; name: string; signal?: AbortSignal;
@@ -77,7 +86,7 @@ export function interactiveArgs(args: string[]): string[] {
   return result;
 }
 
-export async function runInPane(layout: MasterLayout, spec: PaneLaunch): Promise<{ code: number; error?: string }> {
+export async function runInPane(layout: MasterLayout, spec: PaneLaunch): Promise<PaneExit> {
   spec.signal?.throwIfAborted();
   // Keep Node's entrypoint before Pi flags.
   const entry = spec.args[0]?.match(/\.(?:mjs|cjs|js)$/) ? spec.args.slice(0, 1) : [];

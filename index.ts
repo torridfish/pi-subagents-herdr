@@ -83,7 +83,28 @@ export interface AgentProgress {
 	durationMs: number;
 	lastMessage: string;
 	error?: string;
+	/**
+	 * Why the run ended early, when something ended it rather than the child
+	 * finishing. A failure and a stop are not the same news: a model told its
+	 * child "failed" reaches for a retry, which is the wrong move when the
+	 * answer is that somebody pressed Ctrl+C.
+	 */
+	stoppedBy?: StopReason;
 }
+
+/** `user` interrupted the turn, `session` ended under the run, and `parent`
+ *  means this process stopped answering and the child's pane watcher put it
+ *  down — the only one of the three that is nobody's decision. */
+export type StopReason = "user" | "session" | "parent";
+
+/** What each stop is called, to the model and in the roster. Worded as
+ *  statements of fact rather than as errors: none of them is the child's
+ *  doing, and two of them are somebody's deliberate decision. */
+export const STOP_MESSAGES: Record<StopReason, string> = {
+	user: "Stopped by the user, who interrupted the turn it was dispatched in",
+	session: "Stopped because the session that dispatched it ended",
+	parent: "Stopped because the session that dispatched it went away without saying so",
+};
 
 export interface AgentResult {
 	agent: string;
@@ -697,6 +718,19 @@ async function runSubagent(
 	}, 150);
 
 	let exitCode = 1;
+	/**
+	 * Record that something stopped this run, and say what.
+	 *
+	 * The abort that reaches here is `AbortSignal.any([<the turn>, <the
+	 * session>])`, so the two are told apart by the reason the aborter passed:
+	 * the extension tags its own, and anything else is the turn being
+	 * interrupted — which in practice means the user.
+	 */
+	const stopped = (reason?: unknown) => {
+		const tagged = (reason as { subagentStop?: StopReason } | undefined)?.subagentStop;
+		progress.stoppedBy = tagged ?? "user";
+		progress.error = STOP_MESSAGES[progress.stoppedBy];
+	};
 	// The question a `caller_ping` call is waiting on, read off the child's own
 	// event stream. Cleared by `deliver`, which is the only thing that answers.
 	let question: string | undefined;
@@ -891,7 +925,12 @@ async function runSubagent(
 			void runInPane(layout, { command, args: spawnArgs, cwd, env, directory: tempDir,
 				name: handle, signal, onLine: processLine, onPane: id => { paneId = id; },
 				bridge: runner === "claude" ? "claude" : "pi", openingPrompt }).then(exit => {
-				if (exit.error) progress.error = exit.error;
+				// The pane watcher knows something this process cannot: whether this
+				// process was still there. A run it ended because the heartbeat went
+				// stale was not cancelled by anyone — it was orphaned.
+				if (exit.stop === "parent") stopped({ subagentStop: "parent" });
+				else if (exit.stop === "cancelled") stopped(signal?.reason);
+				else if (exit.error) progress.error = exit.error;
 				resolve(exit.code);
 			}, error => { progress.error = String(error); resolve(1); });
 			return;
@@ -953,7 +992,7 @@ async function runSubagent(
 		let closed = false;
 		let killTimer: ReturnType<typeof setTimeout> | undefined;
 		const kill = () => {
-			progress.error = "Subagent cancelled";
+			stopped(signal?.reason);
 			proc.kill("SIGTERM");
 			killTimer = setTimeout(() => { if (!closed) proc.kill("SIGKILL"); }, 3000);
 		};
@@ -1123,9 +1162,12 @@ function renderAgentProgress(
 			? theme.fg("dim", "○")
 			: isWaiting
 				? theme.fg("warning", "?")
-				: r.exitCode === 0
-					? theme.fg("success", "✓")
-					: theme.fg("error", "✗");
+				: prog.stoppedBy
+					// Not a failure mark: nothing went wrong with the child.
+					? theme.fg("dim", "⊘")
+					: r.exitCode === 0
+						? theme.fg("success", "✓")
+						: theme.fg("error", "✗");
 	const stats = `${prog.toolCount} tools · ${formatDuration(prog.durationMs)}`;
 	const modelStr = r.model ? theme.fg("dim", ` (${r.model})`) : "";
 	addLine(`${icon} ${theme.fg("toolTitle", theme.bold(r.agent))}${modelStr} — ${theme.fg("dim", stats)}`);
@@ -1419,6 +1461,10 @@ export default function (pi: ExtensionAPI) {
 	let layout: MasterLayout | undefined;
 	let ownedLayoutDir: string | undefined;
 	const shutdown = new AbortController();
+	/** Distinguishes the two aborts that reach a child, which are otherwise one
+	 *  signal by the time `runSubagent` sees them (`AbortSignal.any` below).
+	 *  `AbortSignal.any` forwards the reason of whichever fired. */
+	const SESSION_ENDED = { subagentStop: "session" as StopReason };
 	const running = new Set<Promise<unknown>>();
 	// Dispatched runs, keyed by the handle the widget shows. A record is removed
 	// the instant its result is steered, so `runs` is exactly "what is in flight".
@@ -1505,11 +1551,18 @@ export default function (pi: ExtensionAPI) {
 	 */
 	const steerResult = (record: RunRecord) => {
 		const r = record.result;
-		const failed = r.exitCode !== 0 || !!r.progress.error;
+		const stop = r.progress.stoppedBy;
+		const failed = !stop && (r.exitCode !== 0 || !!r.progress.error);
 		const elapsed = formatDuration(r.progress.durationMs);
-		const content = failed
-			? `Subagent ${record.id} (${record.agent}) failed after ${elapsed}: ${r.progress.error || r.output || `exited ${r.exitCode}`}`
-			: `Subagent ${record.id} (${record.agent}) finished in ${elapsed}.\n\n${r.output || "(no output)"}`;
+		// A stop is reported as what it is, and with what to do about it, because
+		// "failed" is what makes a model try the same dispatch again — exactly the
+		// wrong move when the reason is that somebody stopped it on purpose.
+		const content = stop
+			? `Subagent ${record.id} (${record.agent}) was stopped after ${elapsed}. ${STOP_MESSAGES[stop]}.`
+				+ (stop === "user" ? " Do not dispatch it again unless they ask; say what it had got through, and wait." : "")
+			: failed
+				? `Subagent ${record.id} (${record.agent}) failed after ${elapsed}: ${r.progress.error || r.output || `exited ${r.exitCode}`}`
+				: `Subagent ${record.id} (${record.agent}) finished in ${elapsed}.\n\n${r.output || "(no output)"}`;
 		pi.sendMessage<Details>(
 			{ customType: "subagent_result", content, display: true, details: { results: [r], handle: record.id } },
 			{ triggerTurn: true, deliverAs: "steer" },
@@ -1569,7 +1622,7 @@ export default function (pi: ExtensionAPI) {
 	Object.assign(CUSTOM_TOOL_EXTENSIONS, JSON.parse(process.env.PI_SUBAGENT_TOOL_EXTENSIONS || "{}"), config.toolExtensions);
 	pi.on("session_start", (_event, ctx) => { uiCtx = ctx; updateWidget(); });
 	pi.on("session_shutdown", async () => {
-		shutdown.abort();
+		shutdown.abort(SESSION_ENDED);
 		await Promise.allSettled([...running]);
 		stopTicker();
 		// Every run directory outlives its child, because a finished subagent can

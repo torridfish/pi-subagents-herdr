@@ -25,29 +25,36 @@ if (bridged) {
   const { attachClaudeBridge } = await import("./claude-pane.mjs");
   attachClaudeBridge(child, directory, spec.openingPrompt);
 }
-let finished = false, terminating = false, killer;
-function stop() {
+let finished = false, terminating = false, killer, stoppedBy;
+// Why this child was put down, which the parent cannot work out for itself:
+// `cancel` is the parent asking, a stale heartbeat is the parent having gone
+// away without asking, and a signal is somebody at this pane or the machine
+// shutting down. Only the first two are distinguishable to whoever reads the
+// result, and they are different news.
+function stop(reason) {
   if (finished || terminating) return;
   terminating = true;
+  stoppedBy = reason;
   child.kill("SIGTERM");
   killer = setTimeout(() => { if (!finished) child.kill("SIGKILL"); }, 3000);
 }
 const watcher = setInterval(() => {
   try {
-    if (fs.existsSync(path.join(directory, "cancel")) || Date.now() - fs.statSync(path.join(directory, "heartbeat")).mtimeMs > 20000) stop();
-  } catch { stop(); }
+    if (fs.existsSync(path.join(directory, "cancel"))) return stop("cancelled");
+    if (Date.now() - fs.statSync(path.join(directory, "heartbeat")).mtimeMs > 20000) return stop("parent");
+  } catch { stop("parent"); }
 }, 500);
 function finish(code, error) {
   if (finished) return;
   finished = true;
   clearInterval(watcher); clearTimeout(killer);
   const target = path.join(directory, "exit.json");
-  fs.writeFileSync(target + ".tmp", JSON.stringify({ code, error }), { mode: 0o600 });
+  fs.writeFileSync(target + ".tmp", JSON.stringify({ code, error, stop: stoppedBy }), { mode: 0o600 });
   fs.renameSync(target + ".tmp", target);
   process.exitCode = code;
 }
 child.on("error", error => finish(1, error.message));
 child.on("close", code => finish(terminating ? 130 : (code ?? 1)));
-process.on("SIGTERM", stop);
-process.on("SIGHUP", stop);
-process.on("SIGINT", stop);
+process.on("SIGTERM", () => stop("signal"));
+process.on("SIGHUP", () => stop("signal"));
+process.on("SIGINT", () => stop("signal"));
