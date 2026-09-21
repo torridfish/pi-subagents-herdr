@@ -24,7 +24,7 @@ Each child's pane is labelled with its handle (`researcher-2`), not its agent ty
 - **Flat topology**: no bundled agent carries the `subagent` tool, so every child is dispatched by the main session. The nesting machinery (`subagent_agents`, `PI_SUBAGENT_ALLOWED`, the cross-process layout lock) is still in place and dormant — granting `subagent` in an agent's frontmatter turns it back on, but a child that dispatches asynchronously and then settles will shut down before its own children finish.
 - Parent cancellation/shutdown cleans up owned children. A runner heartbeat terminates a child after loss of its parent. Manual topology changes fail safely instead of rearranging unrelated panes.
 - Outside Herdr, `auto` uses upstream-style headless JSON subprocesses. A Herdr failure is reported, never silently rerun in a second backend.
-- Pluggable **runners**: an agent runs as a Pi child by default, or as a headless Claude Code child (`runner: claude`, process backend only). Both feed the same progress display, concurrency limit, cancellation and question loop.
+- Pluggable **runners**: an agent runs as a Pi child by default, or as a headless Claude Code child (`runner: claude`). Both feed the same progress display, concurrency limit, cancellation and question loop, and both get their own Herdr pane.
 
 ## Install
 
@@ -136,7 +136,7 @@ What differs is what keeps the child alive between turns. A pi child is driven o
 
 ## Runners
 
-A **runner** is the child process that executes an agent. `pi` is the default and the only one the Herdr backend can drive. `claude` runs the agent as a headless `claude -p --output-format stream-json` process instead, and is **process-backend only**.
+A **runner** is the child process that executes an agent. `pi` is the default. `claude` runs the agent as a headless `claude -p --output-format stream-json` process instead. Both work on both backends.
 
 Select one per agent in `config.json`, or with `runner:` in an agent's frontmatter:
 
@@ -150,7 +150,7 @@ A single call can also override both, which is how a conversational instruction 
 { "agent": "scout", "task": "Map the auth module.", "runner": "claude" }
 ```
 
-Precedence: explicit `runner` on the call → per-agent config → `default` config → frontmatter → `pi`. An unrecognised name is refused instead of silently falling back. Under `backend: auto` a claude agent silently uses the process backend even inside Herdr; under an explicit `backend: herdr` it is refused with an error rather than opening a pane that can never report back. The reason is structural: a pane child returns its results through `herdr/child.ts`, which is itself a Pi extension, so only a Pi process can load it.
+Precedence: explicit `runner` on the call → per-agent config → `default` config → frontmatter → `pi`. An unrecognised name is refused instead of silently falling back. Both runners open a pane under the Herdr backend, by different bridges — see [Watching a claude child](#watching-a-claude-child).
 
 Everything downstream of the child is shared — the in-flight widget, the steered result and its `Ctrl+O` progress block, the concurrency semaphore, cancellation, and output truncation all work the same for both runners.
 
@@ -167,6 +167,20 @@ Everything downstream of the child is shared — the in-flight widget, the steer
 `safe_bash` and `subagent` are rejected, so **worker cannot run under the claude runner**: Claude Code has no filtered shell, and its `Task` tool spawns its own agent types rather than the ones registered here. Scout and researcher map cleanly. `ls` folds into `Glob` because current Claude Code has no `LS` tool.
 
 **Permissions.** The declared tools are passed as both `--tools` (what exists in the child) and `--allowedTools` (pre-approved, so a headless child never stops on a prompt), alongside `--permission-prompts none` so anything outside that set is denied instead of hanging forever. Pre-approving `bash`, `write` or `edit` is a real grant — the child runs them without asking. Denied calls are reported in the parent's transcript even when the run otherwise succeeds.
+
+### Watching a claude child
+
+A claude child gets a pane like a pi child does, but it cannot earn one the same way. A pi child writes the journal its parent tails from inside itself, through `herdr/child.ts`, and owns the pane's terminal directly. Claude Code loads no extension of ours and has no interactive mode whose events can be read, so the pane runs `herdr/claude-pane.mjs` wrapped around the same headless child the process backend uses:
+
+```
+claude stdout ─┬─→ events.jsonl   (the journal the parent tails)
+               └─→ the pane        (rendered for whoever is watching)
+pane stdin ──────→ claude stdin    (as a stream-json user message)
+```
+
+So the pane is not a read-only view. Anything typed into it reaches the child as a user message — which is the same door `subagent_message` uses, since the parent answers a pane child by typing into its pane. You can answer a question yourself without going through the parent at all.
+
+The bridge also owns the one decision the parent makes on the process backend: a claude child cannot end its own session, so when a turn settles with no question outstanding, the thing holding its stdin closes it. In a pane that is the bridge; without one it is the parent.
 
 **Differences worth knowing.** `inherit.skills` maps to `--disable-slash-commands`; `inherit.extensions` has no exact analogue, and setting it to `false` only refuses your MCP servers (`--strict-mcp-config`) — a claude child still reads your `CLAUDE.md`, settings and hooks. Models are given as pi's `provider/model-id`; an `anthropic/` prefix is stripped and a bare alias (`sonnet`) passes through, while a non-Anthropic parent model is dropped and the child falls back to `claude.model` (default `claude-opus-5`). That fallback is named rather than left off deliberately: with no `--model`, Claude Code runs its own default, the top of the range, so every child dispatched from a session on a non-Anthropic model would silently be the most expensive one in the fleet. `thinking` maps to `--effort`, with `off` floored at `low`. A claude child re-sends its own full system prompt, so a short task costs noticeably more than the same task on a pi child. Session persistence is left on, because it is what makes a finished child resumable: a claude child's conversation lands in your own session store rather than in its run directory, and so outlives the run directory that the end of a session reclaims.
 

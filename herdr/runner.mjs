@@ -13,7 +13,18 @@ env.PI_SUBAGENT_RUN_DIR = directory;
 // children are read from stdout and must not write one.
 env.PI_SUBAGENT_BRIDGE = "1";
 for (const key of ["PI_SESSION_ID", "PI_SESSION_FILE", "PI_PROVIDER", "PI_MODEL", "PI_REASONING_LEVEL"]) delete env[key];
-const child = spawn(spec.command, spec.args, { cwd: spec.cwd, env, stdio: "inherit" });
+// A pi child owns the pane's terminal and writes the journal itself, through
+// the extension it loads. A claude child can do neither, so it is spawned with
+// its ends piped and `claude-pane.mjs` sits between it and the pane.
+const bridged = spec.bridge === "claude";
+const child = spawn(spec.command, spec.args, {
+  cwd: spec.cwd, env,
+  stdio: bridged ? ["pipe", "pipe", "inherit"] : "inherit",
+});
+if (bridged) {
+  const { attachClaudeBridge } = await import("./claude-pane.mjs");
+  attachClaudeBridge(child, directory, spec.openingPrompt);
+}
 let finished = false, terminating = false, killer;
 function stop() {
   if (finished || terminating) return;

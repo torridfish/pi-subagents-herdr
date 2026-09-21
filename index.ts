@@ -683,8 +683,8 @@ async function runSubagent(
 	const { runner, args, tempDir, childEnv, openingPrompt, protocol } = prepared;
 	const onUpdate = hooks.onUpdate;
 	// Defence in depth: execute() already refuses this combination with a better
-	// message, but a pane child has no result channel for a non-pi runner.
-	if (layout && runner !== "pi") throw new Error(`The ${runner} runner supports the process backend only`);
+	// message, but only pi and claude have a way to report out of a pane.
+	if (layout && runner !== "pi" && runner !== "claude") throw new Error(`The ${runner} runner supports the process backend only`);
 	const command = args[0];
 	const spawnArgs = args.slice(1);
 
@@ -871,9 +871,14 @@ async function runSubagent(
 			: processPiLine;
 
 		if (layout) {
-			const env = { ...childEnv, PI_SUBAGENT_LAYOUT_DIR: layout.directory,
-				PI_SUBAGENT_MASTER: layout.master, PI_SUBAGENT_BACKEND: "herdr",
-				PI_SUBAGENT_TOOL_EXTENSIONS: JSON.stringify(CUSTOM_TOOL_EXTENSIONS) };
+			// PI_SUBAGENT_* is how a pi child is told which transport and tool
+			// extensions it inherited. A claude child is told none of it: the pane
+			// it runs in is the bridge's business, not its own.
+			const env = runner === "pi"
+				? { ...childEnv, PI_SUBAGENT_LAYOUT_DIR: layout.directory,
+					PI_SUBAGENT_MASTER: layout.master, PI_SUBAGENT_BACKEND: "herdr",
+					PI_SUBAGENT_TOOL_EXTENSIONS: JSON.stringify(CUSTOM_TOOL_EXTENSIONS) }
+				: (childEnv ?? process.env);
 			// A pane child has no stdin its parent can write to, so it is typed to —
 			// the same door the user sitting at that pane would use. Same contract as
 			// the RPC sender, different mechanism.
@@ -884,7 +889,8 @@ async function runSubagent(
 				delivered();
 			});
 			void runInPane(layout, { command, args: spawnArgs, cwd, env, directory: tempDir,
-				name: handle, signal, onLine: processLine, onPane: id => { paneId = id; } }).then(exit => {
+				name: handle, signal, onLine: processLine, onPane: id => { paneId = id; },
+				bridge: runner === "claude" ? "claude" : "pi", openingPrompt }).then(exit => {
 				if (exit.error) progress.error = exit.error;
 				resolve(exit.code);
 			}, error => { progress.error = String(error); resolve(1); });
@@ -1632,13 +1638,15 @@ export default function (pi: ExtensionAPI) {
 			// A pinned path is loaded explicitly, so it is no longer discovery's job.
 			for (const tool of Object.keys(config.toolExtensions ?? {})) DISCOVERED_TOOL_EXTENSIONS.delete(tool);
 			Object.assign(CUSTOM_TOOL_EXTENSIONS, config.toolExtensions);
-			// Only pi children can report back from a pane: the sidecar that bridges
-			// their events (`herdr/child.ts`) is itself a pi extension. `auto` picks
-			// the process backend for anything else; an explicit `herdr` says so.
-			if (agent.runner !== "pi" && backend === "herdr") {
+			// Both runners can report back from a pane, by different bridges: a pi
+			// child writes the journal itself through `herdr/child.ts`, and a claude
+			// child is wrapped in `herdr/claude-pane.mjs`, which writes it for one.
+			// Anything else has no way home from a pane.
+			const paneCapable = agent.runner === "pi" || agent.runner === "claude";
+			if (!paneCapable && backend === "herdr") {
 				throw new Error(`Agent ${agent.name} runs under the ${agent.runner} runner, which supports the process backend only. Select /subagents-herdr process or auto.`);
 			}
-			const useHerdr = agent.runner === "pi" && (backend === "herdr" || (backend === "auto" && process.env.HERDR_ENV === "1"));
+			const useHerdr = paneCapable && (backend === "herdr" || (backend === "auto" && process.env.HERDR_ENV === "1"));
 			if (useHerdr && !layout) {
 				if (process.env.HERDR_ENV !== "1" || !process.env.HERDR_PANE_ID) throw new Error("Run Pi inside Herdr or select /subagents-herdr process");
 				const directory = process.env.PI_SUBAGENT_LAYOUT_DIR ?? (ownedLayoutDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-master-")));
@@ -1820,7 +1828,10 @@ export default function (pi: ExtensionAPI) {
 			const body = `Your caller has more for you: ${message}\n\nYou are picking up the session you already did work in. Carry on from there rather than starting over.`;
 			let args = loadout.args;
 			let openingPrompt: string | undefined;
-			if (loadout.pane) {
+			// A bridged pane child is driven over the same channel in a pane as it
+			// is without one, so it takes its prompt the same way too. Only an
+			// interactive pi child reads it out of argv.
+			if (loadout.pane && loadout.runner !== "claude") {
 				// A pane child takes its prompt in argv, where a long one has to go
 				// through a file, exactly as the original task did.
 				let prompt = body;

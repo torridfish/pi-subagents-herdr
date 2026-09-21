@@ -188,7 +188,7 @@ test("denials on an otherwise successful run are still reported", () => {
 
 // ── Backend guard ─────────────────────────────────────────────────────
 
-test("the herdr backend refuses a claude-run agent instead of opening a dead pane", async () => {
+test("the herdr backend takes a claude-run agent like any other", async () => {
   const { default: extension, registerAgent } = await import("../index.ts");
   const tools = new Map<string, any>(), commands = new Map<string, any>(), handlers = new Map<string, any>();
   extension({ registerTool: (t: any) => tools.set(t.name, t), registerCommand: (n: string, c: any) => commands.set(n, c),
@@ -196,12 +196,22 @@ test("the herdr backend refuses a claude-run agent instead of opening a dead pan
     registerMessageRenderer() {}, sendMessage() {} } as any);
   const ctx = { cwd: process.cwd(), model: { provider: "anthropic", id: "claude-sonnet-5" },
     modelRegistry: { find: () => undefined }, ui: { notify() {} } };
+  // Unset for the length of the test whether or not the suite is being run
+  // from inside Herdr: the assertion below is about which error comes back,
+  // and with a real Herdr around it the call would open a real pane.
+  const herdrEnv = process.env.HERDR_ENV;
+  delete process.env.HERDR_ENV;
   try {
     registerAgent({ ...AGENT, name: "claude-probe", tools: ["read"] });
     const call = () => tools.get("subagent").execute("test", { agent: "claude-probe", task: "t" }, undefined, undefined, ctx);
     await commands.get("subagents-herdr").handler("herdr", ctx);
-    // A pane child reports back through a pi extension, so a claude child in one
-    // would have no result channel at all.
-    await assert.rejects(call(), /claude runner, which supports the process backend only/);
-  } finally { await handlers.get("session_shutdown")(); }
+    // It used to be refused here: a pane child reported back through a pi
+    // extension, which a claude child cannot load. `herdr/claude-pane.mjs`
+    // writes that journal for one instead, so the only thing left in the way
+    // is the ordinary one — this session is not running inside Herdr.
+    await assert.rejects(call(), /Run Pi inside Herdr or select \/subagents-herdr process/);
+  } finally {
+    if (herdrEnv === undefined) delete process.env.HERDR_ENV; else process.env.HERDR_ENV = herdrEnv;
+    await handlers.get("session_shutdown")();
+  }
 });
