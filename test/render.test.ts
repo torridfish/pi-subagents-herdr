@@ -1,8 +1,15 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import * as path from "node:path";
+import * as os from "node:os";
+import * as fs from "node:fs";
 
 // Pinned before the extension loads: see async-dispatch.test.ts.
 process.env.PI_SUBAGENT_BACKEND = "process";
+// Pinned for the same reason, and a stronger one: without it these tests write
+// handles into the developer's own ~/.pi and read back the ones their last run
+// left there, so the suite's result depends on how many times it has been run.
+process.env.PI_SUBAGENT_STATE_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "subagent-state-"));
 import type { AgentResult } from "../index.ts";
 const { default: extension } = await import("../index.ts");
 

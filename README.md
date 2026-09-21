@@ -134,6 +134,27 @@ Both runners have it, by different plumbing. A pi child gets `caller_ping` from 
 
 What differs is what keeps the child alive between turns. A pi child is driven over `--mode rpc` and shuts its own session down when the task is done. Claude Code's streaming input (`--input-format stream-json`) parks the same way, but a claude child cannot end its own session — so the parent closes its stdin once a turn settles with nothing outstanding. And where a pi run is picked back up from a session file in its run directory, a claude run is picked back up by id: `--session-id` at launch, `--resume` afterwards, against the conversation in your own session store.
 
+## Handles across a restart
+
+A handle used to mean nothing once the parent went away: `session_shutdown` deleted every run directory, and the roster it was keyed in lived only in memory. Now a settled run is recorded in `~/.pi/subagents-herdr/<project>.json` (override with `PI_SUBAGENT_STATE_DIR`), and the next session in that directory adopts the handles it finds. `subagent_message` picks the same child back up from the loadout beside its session, exactly as it does within one session.
+
+What this does **not** do is reattach to a running child, because after the parent goes there is never one. That was worth measuring rather than assuming, and both backends turn out to clean up after themselves: a process child is driven over its stdin, so when the parent dies the pipe closes and the child exits on EOF (a real `claude` child takes about two seconds); a pane child is put down by its own watcher once the heartbeat in its run directory goes stale for 20 seconds. So an adopted handle is a conversation to resume, never a process to rejoin.
+
+Retention is a privacy decision as much as a disk one — a kept run directory holds the child's whole transcript — so it is enforced at startup rather than left to something remembering to tidy up: anything past `retainRunsHours` has its directory deleted and its entry dropped before any of it is restored. An adopted run that nobody touches keeps the age it already had, so the window does not reset every time you open the editor. Run directories still live under the system temp directory, so a reboot may take them earlier than the window would.
+
+One case cannot be adopted: a pi child that ran in a pane. Its loadout holds an interactive invocation with no stdin channel to put a prompt on, and its pane belonged to the session that opened it. That is refused with a message saying so rather than relaunched into something it was not.
+
+## Stopped, or failed
+
+A run that ends early says which, because they are not the same news and one of them is actively misleading — a model told its child "failed" reaches for a retry, which is the wrong move when the answer is that somebody pressed Ctrl+C. Four endings, told apart:
+
+| Ending | How it is known | Reported as |
+| --- | --- | --- |
+| The user interrupted the turn | the tool call's abort, carrying nobody's reason | `⊘` *Stopped by the user* — plus an explicit "do not dispatch it again unless they ask" |
+| The session ended under the run | the extension's own abort, which tags its reason | `⊘` *Stopped because the session ended* |
+| The parent went away without saying so | only the pane watcher can see this: a stale heartbeat, recorded in `exit.json` | `⊘` *Stopped because the session went away* |
+| The child broke | a non-zero exit, stderr, or an error in the event stream | `✗` *failed*, with what it said |
+
 ## Runners
 
 A **runner** is the child process that executes an agent. `pi` is the default. `claude` runs the agent as a headless `claude -p --output-format stream-json` process instead. Both work on both backends.
@@ -207,6 +228,7 @@ Copy `config.json.example` to `config.json` beside `index.ts` (gitignored):
 - `maxConcurrency`: positive integer, per parent process, default 4.
 - `minPaneRows`: minimum rows per child, default 8. If the shared stack is full, the next call fails with a capacity message rather than creating an unreadable pane. Nested agents count toward this geometry limit, but have their own execution semaphore.
 - `runners`: agent name → `pi` (default) or `claude`; `default` is an optional fallback. See [Runners](#runners).
+- `retainRunsHours`: how long a finished run stays addressable after the session that dispatched it ends (default `168`, a week; `0` reclaims every run directory at shutdown, which is what this did before handles survived a restart). See [Handles across a restart](#handles-across-a-restart).
 - `claude`: settings for the claude runner — `command` (default `claude`, resolved on PATH), `permissionMode` (passed to `--permission-mode`; declared tools are pre-approved regardless), `maxBudgetUsd` (passed to `--max-budget-usd`, a hard per-child ceiling), and `model`, the fallback for a child whose resolved model Claude Code cannot use (default `claude-opus-5`). Ignored by pi-run agents.
 - `models`: agent name → exact `provider/model-id`; `default` is an optional fallback. Precedence: per-agent config → default config → agent frontmatter → parent model. Bundled agents inherit the parent's current model; no Anthropic credentials are assumed.
 - `toolExtensions`: optional tool name → absolute extension file path; overrides automatic discovery. A pinned tool is always handed to the child explicitly.

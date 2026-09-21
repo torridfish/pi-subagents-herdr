@@ -8,6 +8,10 @@ import childExtension from "../herdr/child.ts";
 // Pinned before the extension loads, for the same reason async-dispatch.test.ts
 // does it: a unit test must not open panes in the terminal it runs from.
 process.env.PI_SUBAGENT_BACKEND = "process";
+// Pinned for the same reason, and a stronger one: without it these tests write
+// handles into the developer's own ~/.pi and read back the ones their last run
+// left there, so the suite's result depends on how many times it has been run.
+process.env.PI_SUBAGENT_STATE_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "subagent-state-"));
 const { buildPiArgs, DEFAULT_INHERIT, default: extension } = await import("../index.ts");
 
 const agent = { name: "probe", description: "", tools: ["read"], model: "test/model", thinking: "medium", systemPrompt: "", filePath: "" };
@@ -260,9 +264,10 @@ test("a child that asks a question waits, alive, until it is answered", async ()
     await until("the follow-up to finish", () => result.progress.status === "completed" && pi.commands().length > 2);
     assert.match(pi.commands()[2].message, /Your caller has more for you: one more thing/);
 
-    // And every run directory goes when the session that owns them does.
+    // The run directory no longer goes when the session does — that is what
+    // made a handle worthless the moment the parent restarted.
     await shutdownAll();
-    assert.equal(fs.existsSync(commands[0].dir), false, "a run directory outlived its session");
+    assert.equal(fs.existsSync(commands[0].dir), true, "the run directory was reclaimed with its session");
   } finally {
     // Unconditional: a live child outlives a failed assertion and would keep
     // the test runner itself from exiting.
@@ -457,6 +462,84 @@ test("the session ending under a run says so, rather than blaming the user", asy
     // record, and a run directory may outlive the process that wrote it.
     assert.match(steers.at(-1).content, /was stopped after/);
   } finally {
+    pi.restore();
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+
+// ── Handles that outlive the parent ───────────────────────────────────
+//
+// Nothing is still *running* after the parent goes: a process child loses the
+// pipe its stdin was on, and a pane child is put down by its own watcher. What
+// a restored handle buys is the conversation, which is the part worth keeping.
+test("a handle survives the session that dispatched it", async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "restore-test-"));
+  const pi = stubPi(directory);
+  const shutdowns: Array<() => Promise<void>> = [];
+  try {
+    const first = load();
+    shutdowns.push(async () => { await first.handlers.get("session_shutdown")(); });
+    const ack = await first.tools.get("subagent").execute("t", { agent: "scout", task: "pick a store" }, undefined, undefined, ctx);
+    const handle = ack.details.dispatched;
+    await until("the run to park", () => ack.details.results[0].progress.status === "waiting");
+    await first.tools.get("subagent_message").execute("m", { handle, message: "Postgres" }, undefined, undefined, ctx);
+    await until("the run to finish", () => ack.details.results[0].progress.status === "completed");
+    const runDir = pi.commands()[0].dir;
+    await first.handlers.get("session_shutdown")();
+
+    // A second extension instance is a second session: it dispatched nothing,
+    // and everything it knows about this handle it read off the disk.
+    const next = load();
+    shutdowns.push(async () => { await next.handlers.get("session_shutdown")(); });
+    const before = pi.commands().length;
+    await next.tools.get("subagent_message").execute("m", { handle, message: "still there?" }, undefined, undefined, ctx);
+    await until("the adopted run to finish", () => pi.commands().length > before);
+    const picked = pi.commands()[before];
+    assert.match(picked.message, /Your caller has more for you: still there\?/);
+    assert.equal(picked.dir, runDir, "a fresh child was started instead of the one the handle names");
+
+    // And a handle it never had is refused in terms that say which is which.
+    await assert.rejects(
+      () => next.tools.get("subagent_message").execute("m", { handle: "scout-99", message: "x" }, undefined, undefined, ctx),
+      /Still addressable from an earlier session: scout-/,
+    );
+  } finally {
+    for (const stop of shutdowns) await stop();
+    pi.restore();
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("a run that has aged out is deleted rather than adopted", async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "prune-test-"));
+  const pi = stubPi(directory);
+  let shutdownAll = async () => {};
+  try {
+    const first = load();
+    shutdownAll = async () => { await first.handlers.get("session_shutdown")(); };
+    const ack = await first.tools.get("subagent").execute("t", { agent: "scout", task: "pick a store" }, undefined, undefined, ctx);
+    await until("the run to park", () => ack.details.results[0].progress.status === "waiting");
+    const runDir = pi.commands()[0].dir;
+    await first.handlers.get("session_shutdown")();
+    assert.equal(fs.existsSync(runDir), true);
+
+    // Backdate it past the retention window. The directory holds the child's
+    // whole transcript, so ageing out has to actually delete it, not just
+    // forget it — a forgotten directory is the same data with no owner.
+    const indexFile = path.join(process.env.PI_SUBAGENT_STATE_DIR!, fs.readdirSync(process.env.PI_SUBAGENT_STATE_DIR!)[0]);
+    const entries = JSON.parse(fs.readFileSync(indexFile, "utf-8"));
+    for (const entry of entries) entry.endedAt = Date.now() - 200 * 3600_000;
+    fs.writeFileSync(indexFile, JSON.stringify(entries));
+
+    const next = load();
+    assert.equal(fs.existsSync(runDir), false, "an aged-out run directory was left on disk");
+    // And an adopted run that nobody touched keeps the age it had, rather than
+    // having its clock reset by every session that opens and closes.
+    assert.deepEqual(JSON.parse(fs.readFileSync(indexFile, "utf-8")), []);
+    await next.handlers.get("session_shutdown")();
+  } finally {
+    await shutdownAll();
     pi.restore();
     fs.rmSync(directory, { recursive: true, force: true });
   }

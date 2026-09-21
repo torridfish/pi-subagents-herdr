@@ -5,6 +5,7 @@
  * Supports single and parallel execution. Output is verbal only (no file handoff).
  */
 import { spawn } from "node:child_process";
+import * as crypto from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { MasterLayout } from "./herdr/layout.ts";
 import { runInPane, sendToPane } from "./herdr/transport.ts";
@@ -163,6 +164,9 @@ interface RunRecord {
 	 *  and replaced by a throwing stub once the child exits, so a stale handle
 	 *  says so instead of writing into a closed pipe. */
 	send?: Sender;
+	/** Adopted from a previous session at startup rather than dispatched by
+	 *  this one. Its child is long gone; what is left is a conversation. */
+	restored?: boolean;
 }
 
 /** A built child invocation, plus which runner built it. Produced before the
@@ -217,6 +221,80 @@ function writeLoadout(prepared: PreparedRun, agent: AgentConfig, cwd: string, pa
 	fs.writeFileSync(path.join(prepared.tempDir, "loadout.json"), JSON.stringify(loadout, null, 2), { mode: 0o600 });
 }
 
+/**
+ * The handles that outlive this process.
+ *
+ * A run directory already describes its run completely — the loadout beside
+ * the session is enough to launch the same child again. What did not survive a
+ * restart was knowing the directory existed: the handle lived in a Map in the
+ * parent, and `session_shutdown` deleted every directory on the way out.
+ *
+ * So the index is small on purpose. It is a list of run directories and what
+ * they were, kept outside them, in the user's own state directory rather than
+ * in the repository or in the run's own temp directory. Everything else is
+ * still read from the loadout at the moment it is needed.
+ *
+ * What this does NOT do is reattach to a live child, because after the parent
+ * goes there is never one: a process child loses the pipe its stdin was on and
+ * exits on EOF, and a pane child is put down by its own watcher once the
+ * heartbeat goes stale. A restored handle is a conversation to pick back up.
+ */
+interface RunIndexEntry {
+	version: 1;
+	handle: string;
+	agent: string;
+	task: string;
+	tempDir: string;
+	endedAt: number;
+	stoppedBy?: StopReason;
+}
+
+/** Overridable so a test never writes into the user's own state directory —
+ *  and so someone can point it at a disk they have chosen deliberately, given
+ *  what a kept run directory contains. */
+const RUN_INDEX_DIR = process.env.PI_SUBAGENT_STATE_DIR || path.join(os.homedir(), ".pi", "subagents-herdr");
+
+/** One index per project, keyed by the directory the session runs in: handles
+ *  are only meaningful next to the code they were dispatched against. */
+function runIndexPath(cwd: string): string {
+	return path.join(RUN_INDEX_DIR, `${crypto.createHash("sha256").update(cwd).digest("hex").slice(0, 16)}.json`);
+}
+
+function readRunIndex(cwd: string): RunIndexEntry[] {
+	try {
+		const parsed = JSON.parse(fs.readFileSync(runIndexPath(cwd), "utf-8"));
+		return Array.isArray(parsed) ? parsed.filter((e) => e?.version === 1 && typeof e.tempDir === "string") : [];
+	} catch { return []; }
+}
+
+function writeRunIndex(cwd: string, entries: RunIndexEntry[]): void {
+	try {
+		fs.mkdirSync(RUN_INDEX_DIR, { recursive: true, mode: 0o700 });
+		const target = runIndexPath(cwd);
+		fs.writeFileSync(target + ".tmp", JSON.stringify(entries, null, 2), { mode: 0o600 });
+		fs.renameSync(target + ".tmp", target);
+	} catch { /* a lost index costs a handle, not a run */ }
+}
+
+/**
+ * Drop what is too old to keep, and what is no longer there.
+ *
+ * The retention decision is deliberate and it is a privacy decision as much as
+ * a disk one: a kept run directory holds the child's whole transcript. The
+ * default is a week, and it is enforced here — at startup, on the way to
+ * restoring — rather than by anything having to remember to tidy up.
+ */
+function pruneRunIndex(cwd: string, retainMs: number): RunIndexEntry[] {
+	const cutoff = Date.now() - retainMs;
+	const kept: RunIndexEntry[] = [];
+	for (const entry of readRunIndex(cwd)) {
+		if (entry.endedAt >= cutoff && fs.existsSync(entry.tempDir)) { kept.push(entry); continue; }
+		fs.rmSync(entry.tempDir, { recursive: true, force: true });
+	}
+	writeRunIndex(cwd, kept);
+	return kept;
+}
+
 function readLoadout(tempDir: string): Loadout | undefined {
 	try {
 		const loadout = JSON.parse(fs.readFileSync(path.join(tempDir, "loadout.json"), "utf-8")) as Loadout;
@@ -252,6 +330,12 @@ interface ExtensionConfig {
 	runners?: Record<string, string>;
 	/** Settings for the claude runner. Ignored by pi-run agents. */
 	claude?: ClaudeRunnerConfig;
+	/** How long a finished run stays addressable after the session that
+	 *  dispatched it ends, in hours. Default 168 (a week); 0 keeps nothing,
+	 *  which is what this did before handles survived a restart. Its run
+	 *  directory holds the child's whole transcript, so this is a privacy
+	 *  setting as much as a disk one. */
+	retainRunsHours?: number;
 	toolExtensions?: Record<string, string>;
 	inherit?: InheritConfig;
 }
@@ -1470,6 +1554,61 @@ export default function (pi: ExtensionAPI) {
 	// the instant its result is steered, so `runs` is exactly "what is in flight".
 	const runs = new Map<string, RunRecord>();
 	let runSeq = 0;
+	const projectDir = process.cwd();
+	const retainMs = Math.max(0, config.retainRunsHours ?? 168) * 3600_000;
+
+	/** Note a settled run in the index, so its handle is still addressable from
+	 *  the next session. Rewritten rather than appended: a run can settle twice
+	 *  (picked back up, settles again) and the index holds one row per handle. */
+	const rememberRun = (record: RunRecord) => {
+		if (retainMs === 0) return;
+		const entry: RunIndexEntry = {
+			version: 1, handle: record.id, agent: record.agent, task: record.result.task,
+			tempDir: record.prepared.tempDir, endedAt: Date.now(),
+			stoppedBy: record.result.progress.stoppedBy,
+		};
+		writeRunIndex(projectDir, [...readRunIndex(projectDir).filter((e) => e.handle !== entry.handle), entry]);
+	};
+
+	/**
+	 * Take back the handles of the previous session, and prune what has aged out.
+	 *
+	 * A restored run is a finished one by definition — whatever was in flight
+	 * when the parent went away is not running now. It is restored so that its
+	 * handle still means something: `subagent_message` can pick the same child
+	 * back up from the session the loadout names.
+	 */
+	const restoreRuns = () => {
+		for (const entry of pruneRunIndex(projectDir, retainMs)) {
+			if (runs.has(entry.handle)) continue;
+			const loadout = readLoadout(entry.tempDir);
+			if (!loadout) continue;
+			const progress: AgentProgress = { agent: entry.agent, status: "completed", task: entry.task,
+				recentTools: [], toolCount: 0, tokens: 0, durationMs: 0, lastMessage: "",
+				stoppedBy: entry.stoppedBy, error: entry.stoppedBy ? STOP_MESSAGES[entry.stoppedBy] : undefined };
+			const result: AgentResult = { agent: entry.agent, task: entry.task, output: "", exitCode: 0,
+				model: loadout.model, usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 }, progress };
+			// Rebuilt from the loadout, which is the only description of this run
+			// that survived. `definition` is a stub: the relaunch path reads the
+			// loadout, never today's config, and that is the point of having one.
+			const prepared: PreparedRun = {
+				runner: loadout.runner, args: loadout.args, tempDir: entry.tempDir,
+				childEnv: { ...process.env, ...loadout.env },
+				sessionPath: loadout.sessionPath, sessionId: loadout.sessionId,
+				protocol: loadout.runner === "claude" ? "claude-stream" : (loadout.pane ? undefined : "pi-rpc"),
+			};
+			runs.set(entry.handle, {
+				id: entry.handle, agent: entry.agent, startedAt: entry.endedAt, result, prepared,
+				definition: { name: entry.agent, description: "", tools: [], model: loadout.model,
+					thinking: "medium", systemPrompt: "", filePath: "", runner: loadout.runner },
+				cwd: loadout.cwd, restored: true,
+			});
+			// Handles are unique within a session and must stay unique across one:
+			// a restored `scout-3` and a fresh `scout-3` are different children.
+			const suffix = Number(entry.handle.slice(entry.handle.lastIndexOf("-") + 1));
+			if (Number.isFinite(suffix)) runSeq = Math.max(runSeq, suffix);
+		}
+	};
 	// Captured on session_start so the completion path — which has no ctx of its
 	// own — can repaint the widget. Stays undefined outside interactive mode (and
 	// under unit tests), which makes every widget call a silent no-op there.
@@ -1532,6 +1671,7 @@ export default function (pi: ExtensionAPI) {
 			// `subagent_message` can start the child up again from its session file.
 			// Only the roster forgets it, because it is no longer in flight.
 			updateWidget();
+			rememberRun(record);
 			steerResult(record);
 		})();
 		running.add(settled);
@@ -1620,16 +1760,24 @@ export default function (pi: ExtensionAPI) {
 	pi.registerMessageRenderer<Details>("subagent_question", renderSteeredRun);
 
 	Object.assign(CUSTOM_TOOL_EXTENSIONS, JSON.parse(process.env.PI_SUBAGENT_TOOL_EXTENSIONS || "{}"), config.toolExtensions);
-	pi.on("session_start", (_event, ctx) => { uiCtx = ctx; updateWidget(); });
+	pi.on("session_start", (_event, ctx) => { uiCtx = ctx; restoreRuns(); updateWidget(); });
 	pi.on("session_shutdown", async () => {
 		shutdown.abort(SESSION_ENDED);
 		await Promise.allSettled([...running]);
 		stopTicker();
-		// Every run directory outlives its child, because a finished subagent can
-		// still be picked back up from the session file inside it. They are all
-		// reclaimed here: once this session is over, nothing can address them.
+		// A run directory outlives its child, because a finished subagent can
+		// still be picked back up from the session inside it — and now it
+		// outlives this session too, for `retainRunsHours`. What is recorded
+		// here is which directories those are; the next session prunes whatever
+		// has aged out. With retention off, they go the way they always did.
 		for (const record of runs.values()) {
-			fs.rmSync(record.prepared.tempDir, { recursive: true, force: true });
+			if (retainMs === 0) { fs.rmSync(record.prepared.tempDir, { recursive: true, force: true }); continue; }
+			// A run adopted at startup and never touched keeps the timestamp it
+			// already had. Re-recording it here would push its age back to zero
+			// every time a session opens and closes, and a retention window that
+			// resets whenever you start the editor is not a retention window.
+			if (record.restored) continue;
+			rememberRun(record);
 		}
 		if (ownedLayoutDir) fs.rmSync(ownedLayoutDir, { recursive: true, force: true });
 	});
@@ -1846,8 +1994,13 @@ export default function (pi: ExtensionAPI) {
 			const handle = params.handle?.trim();
 			const record = handle ? runs.get(handle) : undefined;
 			if (!record) {
-				const known = [...runs.values()].map((r) => `${r.id} (${r.result.progress.status})`);
-				throw new Error(`Unknown subagent handle: ${params.handle}. ${known.length ? `Dispatched this session: ${known.join(", ")}.` : "Nothing has been dispatched this session."}`);
+				// Said separately because they are different things to the model: one
+				// it dispatched and can still be holding a thread with, one it
+				// inherited from a session it cannot see and can only pick back up.
+				const known = [...runs.values()].filter((r) => !r.restored).map((r) => `${r.id} (${r.result.progress.status})`);
+				const inherited = [...runs.values()].filter((r) => r.restored).map((r) => r.id);
+				throw new Error(`Unknown subagent handle: ${params.handle}. ${known.length ? `Dispatched this session: ${known.join(", ")}.` : "Nothing has been dispatched this session."}`
+					+ (inherited.length ? ` Still addressable from an earlier session: ${inherited.join(", ")}.` : ""));
 			}
 			const message = params.message?.trim();
 			if (!message) throw new Error(`subagent_message needs something to say to ${record.id}.`);
@@ -1886,6 +2039,12 @@ export default function (pi: ExtensionAPI) {
 			if (!loadout || !resumable) {
 				throw new Error(`Subagent ${record.id} has finished and its session is gone, so it cannot be picked up again. Dispatch a fresh run with what you have learned.`);
 			}
+			// An interactive pi invocation is what a pane loadout holds, and it has
+			// no stdin channel to put a prompt on. Its pane went with the session
+			// that opened it, so there is nothing to type into either.
+			if (loadout.pane && loadout.runner === "pi" && !record.layout) {
+				throw new Error(`Subagent ${record.id} ran in a pane belonging to a session that has ended, so it cannot be picked back up from here. Dispatch a fresh run with what you have learned.`);
+			}
 			const effectiveSignal = signal ? AbortSignal.any([signal, shutdown.signal]) : shutdown.signal;
 			effectiveSignal.throwIfAborted();
 
@@ -1920,6 +2079,7 @@ export default function (pi: ExtensionAPI) {
 			record.prepared = { ...record.prepared, args, openingPrompt,
 				sessionPath: loadout.sessionPath, sessionId: loadout.sessionId,
 				childEnv: { ...process.env, ...loadout.env } };
+			record.restored = false; // touched: it is this session's run now
 			record.result.question = undefined;
 			record.result.exitCode = -1;
 			record.result.progress.status = "pending";
