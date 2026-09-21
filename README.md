@@ -31,7 +31,7 @@ Each child's pane is labelled with its handle (`researcher-2`), not its agent ty
 Requires current Pi (`@earendil-works`, tested with **0.85.1**), Node **22+**, and Herdr with `layout.export` / `layout.set_split_ratio` (tested against API protocol **22**).
 
 ```bash
-pi install git:github.com/torrid-fish/pi-subagents-herdr
+pi install git:github.com/torridfish/pi-subagents-herdr
 # Private repository: Git must already be authenticated.
 ```
 
