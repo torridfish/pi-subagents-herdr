@@ -45,7 +45,23 @@ export interface ClaudeRunnerConfig {
 	permissionMode?: string;
 	/** Passed through as `--max-budget-usd`. A hard ceiling per child. */
 	maxBudgetUsd?: number;
+	/** What a claude child runs when nothing upstream resolves a model it can
+	 *  use. Default `claude-opus-5`. */
+	model?: string;
 }
+
+/**
+ * The model a claude child falls back to.
+ *
+ * Leaving `--model` off is not the neutral choice it looks like: Claude Code
+ * then picks its own default, which is the top of the range (Fable 5.1, at
+ * 2x Opus 5's per-token price) — so a child dispatched from a session running
+ * any non-Anthropic model would silently be the most expensive thing in the
+ * fleet. Naming one makes the cost of a subagent a decision rather than a
+ * side effect. It is a full id rather than the `opus` alias on purpose: an
+ * alias moves under you when a new Opus ships.
+ */
+export const CLAUDE_DEFAULT_MODEL = "claude-opus-5";
 
 /**
  * pi tool name → Claude Code built-in tool name.
@@ -195,8 +211,10 @@ export async function buildClaudeArgs(
 	// denied outright under `--permission-prompts none`.
 	args.push("--allowedTools", ...tools, CLAUDE_ASK_TOOL);
 
-	const model = resolveClaudeModel(agent.model);
-	if (model) args.push("--model", model);
+	// Precedence, highest first: the agent's own model when Claude Code can use
+	// it (config.models → frontmatter → the parent session's), then the runner's
+	// configured fallback, then ours.
+	args.push("--model", resolveClaudeModel(agent.model) ?? config.model ?? CLAUDE_DEFAULT_MODEL);
 	const effort = EFFORT_LEVELS[agent.thinking];
 	if (effort) args.push("--effort", effort);
 	// The delegation note goes to every agent, with or without a prompt of its

@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import type { AgentConfig, AgentProgress, AgentResult } from "../index.ts";
-import { buildClaudeArgs, CLAUDE_ASK_TOOL, makeClaudeLineHandler, resolveClaudeModel } from "../runners/claude.ts";
+import { buildClaudeArgs, CLAUDE_ASK_TOOL, CLAUDE_DEFAULT_MODEL, makeClaudeLineHandler, resolveClaudeModel } from "../runners/claude.ts";
 import { DEFAULT_INHERIT } from "../index.ts";
 
 const AGENT: AgentConfig = {
@@ -105,9 +105,21 @@ test("inheritance flags and runner settings are honoured", async () => {
 test("only Anthropic models survive the pi provider/id spelling", () => {
   assert.equal(resolveClaudeModel("anthropic/claude-opus-5[1m]"), "claude-opus-5[1m]");
   assert.equal(resolveClaudeModel("sonnet"), "sonnet");
-  // A non-Anthropic parent model means nothing here; let Claude Code default.
+  // A non-Anthropic parent model means nothing here.
   assert.equal(resolveClaudeModel("openai/gpt-5"), undefined);
   assert.equal(resolveClaudeModel(""), undefined);
+});
+
+// Omitting --model is not the neutral choice it looks like: Claude Code then
+// runs its own default, the top of the range, so a child dispatched from a
+// session on any non-Anthropic model would quietly be the priciest one going.
+test("a child whose model does not survive is named one anyway", async () => {
+  const fallback = async (overrides = {}, config = {}) =>
+    valuesAfter((await build({ model: "openai/gpt-5", ...overrides }, DEFAULT_INHERIT, config)).args, "--model");
+  assert.deepEqual(await fallback(), [CLAUDE_DEFAULT_MODEL]);
+  assert.deepEqual(await fallback({}, { model: "sonnet" }), ["sonnet"], "the configured fallback was ignored");
+  assert.deepEqual(await fallback({ model: "anthropic/claude-haiku-4-5" }, { model: "sonnet" }), ["claude-haiku-4-5"],
+    "the agent's own model lost to the fallback");
 });
 
 // ── Event adapter ─────────────────────────────────────────────────────
