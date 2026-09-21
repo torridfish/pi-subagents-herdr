@@ -143,7 +143,15 @@ export async function buildClaudeArgs(
 	const tools: string[] = [];
 	for (const tool of agent.tools) {
 		const unsupported = CLAUDE_UNSUPPORTED_TOOLS[tool];
-		if (unsupported) throw new Error(`Agent ${agent.name} declares ${tool}, which the claude runner cannot provide: ${unsupported}`);
+		// The last sentence is doing real work. Without it a model reads the
+		// advice as "retry differently", and the cheapest retry is to drop
+		// `runner` — which silently dispatches to pi the agent somebody asked to
+		// run on claude, and says nothing about having changed the plan.
+		if (unsupported) {
+			throw new Error(`Agent ${agent.name} declares ${tool}, which the claude runner cannot provide: ${unsupported}. `
+				+ `Do not re-dispatch this without \`runner\`: that runs it on pi instead, which is not what was asked for. `
+				+ `Say that ${agent.name} cannot run under claude, and let whoever asked choose another agent or another runner.`);
+		}
 		const mapped = CLAUDE_TOOL_NAMES[tool];
 		if (!mapped) throw new Error(`Agent ${agent.name} declares ${tool}, which has no Claude Code equivalent; map it in CLAUDE_TOOL_NAMES or run this agent under the pi runner`);
 		if (!tools.includes(mapped)) tools.push(mapped);

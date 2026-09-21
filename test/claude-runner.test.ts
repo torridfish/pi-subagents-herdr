@@ -39,6 +39,9 @@ test("tools with no honest equivalent are refused before spawning", async () => 
   // Claude Code silently DROPS unknown --tools names, so an unmapped tool would
   // otherwise produce an agent quietly missing a capability it declared.
   await assert.rejects(build({ tools: ["safe_bash"] }), /no filtered shell/);
+  // Observed in the wild: the model read the advice in that message as "retry
+  // differently", dropped `runner`, and quietly ran the agent on pi instead.
+  await assert.rejects(build({ tools: ["safe_bash"] }), /Do not re-dispatch this without `runner`/);
   await assert.rejects(build({ tools: ["subagent"] }), /Task tool spawns its own agent types/);
   await assert.rejects(build({ tools: ["video_extract"] }), /no Claude Code equivalent/);
   assert.deepEqual(valuesAfter((await build({ tools: [] })).args, "--tools"), [""]);
