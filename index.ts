@@ -5,6 +5,7 @@
  * Supports single and parallel execution. Output is verbal only (no file handoff).
  */
 import { spawn } from "node:child_process";
+import * as crypto from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { MasterLayout } from "./herdr/layout.ts";
 import { runInPane, sendToPane } from "./herdr/transport.ts";
@@ -15,7 +16,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { getMarkdownTheme, parseFrontmatter, truncateHead, withFileMutationQueue, DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES } from "@earendil-works/pi-coding-agent";
 import { Box, type Component, Container, Markdown, Spacer, Text, visibleWidth } from "@earendil-works/pi-tui";
 import { buildClaudeArgs, makeClaudeLineHandler, type ClaudeRunnerConfig } from "./runners/claude.ts";
-import { extractToolArgsPreview, isRunner, proseSummary, RUNNERS, type RunnerArgs, type RunnerName } from "./runners/shared.ts";
+import { delegationNote, extractToolArgsPreview, isRunner, proseSummary, RUNNERS, type RunnerArgs, type RunnerName } from "./runners/shared.ts";
 import { Type } from "typebox";
 
 // ── Types ──────────────────────────────────────────────────────────────
@@ -83,7 +84,28 @@ export interface AgentProgress {
 	durationMs: number;
 	lastMessage: string;
 	error?: string;
+	/**
+	 * Why the run ended early, when something ended it rather than the child
+	 * finishing. A failure and a stop are not the same news: a model told its
+	 * child "failed" reaches for a retry, which is the wrong move when the
+	 * answer is that somebody pressed Ctrl+C.
+	 */
+	stoppedBy?: StopReason;
 }
+
+/** `user` interrupted the turn, `session` ended under the run, and `parent`
+ *  means this process stopped answering and the child's pane watcher put it
+ *  down — the only one of the three that is nobody's decision. */
+export type StopReason = "user" | "session" | "parent";
+
+/** What each stop is called, to the model and in the roster. Worded as
+ *  statements of fact rather than as errors: none of them is the child's
+ *  doing, and two of them are somebody's deliberate decision. */
+export const STOP_MESSAGES: Record<StopReason, string> = {
+	user: "Stopped by the user, who interrupted the turn it was dispatched in",
+	session: "Stopped because the session that dispatched it ended",
+	parent: "Stopped because the session that dispatched it went away without saying so",
+};
 
 export interface AgentResult {
 	agent: string;
@@ -142,6 +164,9 @@ interface RunRecord {
 	 *  and replaced by a throwing stub once the child exits, so a stale handle
 	 *  says so instead of writing into a closed pipe. */
 	send?: Sender;
+	/** Adopted from a previous session at startup rather than dispatched by
+	 *  this one. Its child is long gone; what is left is a conversation. */
+	restored?: boolean;
 }
 
 /** A built child invocation, plus which runner built it. Produced before the
@@ -176,7 +201,11 @@ interface Loadout {
 	pane: boolean;
 	cwd: string;
 	args: string[];
+	/** Exactly one of these is set, and which one is the runner's business: pi
+	 *  resumes from a session file it was given, claude from an id it was
+	 *  assigned. Either way it is what makes a finished child resumable. */
 	sessionPath?: string;
+	sessionId?: string;
 	env: Record<string, string>;
 }
 
@@ -187,9 +216,83 @@ function writeLoadout(prepared: PreparedRun, agent: AgentConfig, cwd: string, pa
 	}
 	const loadout: Loadout = {
 		version: 1, agent: agent.name, runner: prepared.runner, model: agent.model,
-		pane, cwd, args: prepared.args, sessionPath: prepared.sessionPath, env,
+		pane, cwd, args: prepared.args, sessionPath: prepared.sessionPath, sessionId: prepared.sessionId, env,
 	};
 	fs.writeFileSync(path.join(prepared.tempDir, "loadout.json"), JSON.stringify(loadout, null, 2), { mode: 0o600 });
+}
+
+/**
+ * The handles that outlive this process.
+ *
+ * A run directory already describes its run completely — the loadout beside
+ * the session is enough to launch the same child again. What did not survive a
+ * restart was knowing the directory existed: the handle lived in a Map in the
+ * parent, and `session_shutdown` deleted every directory on the way out.
+ *
+ * So the index is small on purpose. It is a list of run directories and what
+ * they were, kept outside them, in the user's own state directory rather than
+ * in the repository or in the run's own temp directory. Everything else is
+ * still read from the loadout at the moment it is needed.
+ *
+ * What this does NOT do is reattach to a live child, because after the parent
+ * goes there is never one: a process child loses the pipe its stdin was on and
+ * exits on EOF, and a pane child is put down by its own watcher once the
+ * heartbeat goes stale. A restored handle is a conversation to pick back up.
+ */
+interface RunIndexEntry {
+	version: 1;
+	handle: string;
+	agent: string;
+	task: string;
+	tempDir: string;
+	endedAt: number;
+	stoppedBy?: StopReason;
+}
+
+/** Overridable so a test never writes into the user's own state directory —
+ *  and so someone can point it at a disk they have chosen deliberately, given
+ *  what a kept run directory contains. */
+const RUN_INDEX_DIR = process.env.PI_SUBAGENT_STATE_DIR || path.join(os.homedir(), ".pi", "subagents-herdr");
+
+/** One index per project, keyed by the directory the session runs in: handles
+ *  are only meaningful next to the code they were dispatched against. */
+function runIndexPath(cwd: string): string {
+	return path.join(RUN_INDEX_DIR, `${crypto.createHash("sha256").update(cwd).digest("hex").slice(0, 16)}.json`);
+}
+
+function readRunIndex(cwd: string): RunIndexEntry[] {
+	try {
+		const parsed = JSON.parse(fs.readFileSync(runIndexPath(cwd), "utf-8"));
+		return Array.isArray(parsed) ? parsed.filter((e) => e?.version === 1 && typeof e.tempDir === "string") : [];
+	} catch { return []; }
+}
+
+function writeRunIndex(cwd: string, entries: RunIndexEntry[]): void {
+	try {
+		fs.mkdirSync(RUN_INDEX_DIR, { recursive: true, mode: 0o700 });
+		const target = runIndexPath(cwd);
+		fs.writeFileSync(target + ".tmp", JSON.stringify(entries, null, 2), { mode: 0o600 });
+		fs.renameSync(target + ".tmp", target);
+	} catch { /* a lost index costs a handle, not a run */ }
+}
+
+/**
+ * Drop what is too old to keep, and what is no longer there.
+ *
+ * The retention decision is deliberate and it is a privacy decision as much as
+ * a disk one: a kept run directory holds the child's whole transcript. The
+ * default is a week, and it is enforced here — at startup, on the way to
+ * restoring — rather than by anything having to remember to tidy up.
+ */
+function pruneRunIndex(cwd: string, retainMs: number): RunIndexEntry[] {
+	const cutoff = Date.now() - retainMs;
+	const kept: RunIndexEntry[] = [];
+	for (const entry of readRunIndex(cwd)) {
+		if (entry.endedAt >= cutoff && fs.existsSync(entry.tempDir)) { kept.push(entry); continue; }
+		fs.rmSync(entry.tempDir, { recursive: true, force: true });
+	}
+	writeRunIndex(cwd, kept);
+	return kept;
 }
 
 function readLoadout(tempDir: string): Loadout | undefined {
@@ -227,6 +330,12 @@ interface ExtensionConfig {
 	runners?: Record<string, string>;
 	/** Settings for the claude runner. Ignored by pi-run agents. */
 	claude?: ClaudeRunnerConfig;
+	/** How long a finished run stays addressable after the session that
+	 *  dispatched it ends, in hours. Default 168 (a week); 0 keeps nothing,
+	 *  which is what this did before handles survived a restart. Its run
+	 *  directory holds the child's whole transcript, so this is a privacy
+	 *  setting as much as a disk one. */
+	retainRunsHours?: number;
 	toolExtensions?: Record<string, string>;
 	inherit?: InheritConfig;
 }
@@ -514,7 +623,7 @@ export async function buildPiArgs(
 	// for a smaller model — this is what keeps them from contradicting.
 	const promptPath = path.join(tempDir, "system.md");
 	await withFileMutationQueue(promptPath, async () => {
-		await fs.promises.writeFile(promptPath, `${agent.systemPrompt}\n\n${DELEGATION_NOTE}`, { encoding: "utf-8", mode: 0o600 });
+		await fs.promises.writeFile(promptPath, `${agent.systemPrompt}\n\n${delegationNote("caller_ping")}`, { encoding: "utf-8", mode: 0o600 });
 	});
 
 	// A child keeps its conversation in its own run directory rather than in the
@@ -584,9 +693,9 @@ export async function buildPiArgs(
 
 	// An RPC child is handed its task over the wire, where length is not an
 	// issue. Only an argv-carried task needs the file indirection.
-	let rpcPrompt: string | undefined;
+	let openingPrompt: string | undefined;
 	if (!pane) {
-		rpcPrompt = `Task: ${task}`;
+		openingPrompt = `Task: ${task}`;
 	} else if (task.length > TASK_LIMIT) {
 		const taskPath = path.join(tempDir, "task.md");
 		await withFileMutationQueue(taskPath, async () => {
@@ -611,7 +720,8 @@ export async function buildPiArgs(
 		childEnv.PI_SUBAGENT_ALLOWED = agent.subagentAgents.join(",");
 	}
 
-	return { args: [piBin.command, ...args], tempDir, childEnv, sessionPath, rpcPrompt };
+	return { args: [piBin.command, ...args], tempDir, childEnv, sessionPath, openingPrompt,
+		protocol: pane ? undefined : "pi-rpc" };
 }
 
 function extractTextFromContent(content: unknown): string {
@@ -625,21 +735,6 @@ function extractTextFromContent(content: unknown): string {
 	}
 	return "";
 }
-
-/**
- * Appended to every pi child's system prompt, under its own agent role.
- *
- * Its job is to make the child's situation concrete — somebody dispatched this,
- * that somebody is still there, and they can answer — because a role prompt
- * written for autonomous work otherwise reads as "you are on your own".
- */
-const DELEGATION_NOTE = [
-	"## Your caller",
-	"",
-	"You were dispatched by another agent to do this one task. It cannot see your session and you cannot see its conversation, but it is there while you work and it can answer you.",
-	"",
-	"When the brief does not settle something that changes what you produce — which of several valid approaches to take, a value or path you were not given, whether to take a step that cannot be undone — ask with `caller_ping` rather than picking on their behalf. Your session pauses, the answer arrives as your next message, and you continue with everything you have already done. Ask what you cannot establish yourself; find out the rest by reading.",
-].join("\n");
 
 /** Above this many characters a prompt is handed over as a file rather than as
  *  an argument, for the task at dispatch and for the answer on resume alike. */
@@ -690,11 +785,11 @@ async function runSubagent(
 	hooks: RunHooks = {},
 	layout?: MasterLayout,
 ): Promise<AgentResult> {
-	const { runner, args, tempDir, childEnv, stdin, rpcPrompt } = prepared;
+	const { runner, args, tempDir, childEnv, openingPrompt, protocol } = prepared;
 	const onUpdate = hooks.onUpdate;
 	// Defence in depth: execute() already refuses this combination with a better
-	// message, but a pane child has no result channel for a non-pi runner.
-	if (layout && runner !== "pi") throw new Error(`The ${runner} runner supports the process backend only`);
+	// message, but only pi and claude have a way to report out of a pane.
+	if (layout && runner !== "pi" && runner !== "claude") throw new Error(`The ${runner} runner supports the process backend only`);
 	const command = args[0];
 	const spawnArgs = args.slice(1);
 
@@ -707,6 +802,19 @@ async function runSubagent(
 	}, 150);
 
 	let exitCode = 1;
+	/**
+	 * Record that something stopped this run, and say what.
+	 *
+	 * The abort that reaches here is `AbortSignal.any([<the turn>, <the
+	 * session>])`, so the two are told apart by the reason the aborter passed:
+	 * the extension tags its own, and anything else is the turn being
+	 * interrupted — which in practice means the user.
+	 */
+	const stopped = (reason?: unknown) => {
+		const tagged = (reason as { subagentStop?: StopReason } | undefined)?.subagentStop;
+		progress.stoppedBy = tagged ?? "user";
+		progress.error = STOP_MESSAGES[progress.stoppedBy];
+	};
 	// The question a `caller_ping` call is waiting on, read off the child's own
 	// event stream. Cleared by `deliver`, which is the only thing that answers.
 	let question: string | undefined;
@@ -851,14 +959,44 @@ async function runSubagent(
 			onUpdate?.();
 		};
 
+		/** A turn settled with nothing outstanding: the child has said its piece
+		 *  and the run is over. A pi child reaches this state by shutting itself
+		 *  down; a claude child has to be let go, because its stdin is what keeps
+		 *  it alive. Set once the channel exists. */
+		let finish: (() => void) | undefined;
+
 		const processLine = runner === "claude"
-			? makeClaudeLineHandler({ progress, result, fireUpdate, startTime })
+			? makeClaudeLineHandler({
+				progress, result, fireUpdate, startTime,
+				onQuestion: (asked) => { question = asked; },
+				// Same decision the pi path makes on `agent_settled`, in the same
+				// order: park on an unanswered question, otherwise let the child go.
+				onTurnEnd: () => {
+					busy = false;
+					if (question) {
+						if (progress.status !== "waiting") {
+							progress.status = "waiting";
+							result.question = question;
+							progress.durationMs = Date.now() - startTime;
+							onUpdate?.();
+							hooks.onWaiting?.(question);
+						}
+						return;
+					}
+					finish?.();
+				},
+			})
 			: processPiLine;
 
 		if (layout) {
-			const env = { ...childEnv, PI_SUBAGENT_LAYOUT_DIR: layout.directory,
-				PI_SUBAGENT_MASTER: layout.master, PI_SUBAGENT_BACKEND: "herdr",
-				PI_SUBAGENT_TOOL_EXTENSIONS: JSON.stringify(CUSTOM_TOOL_EXTENSIONS) };
+			// PI_SUBAGENT_* is how a pi child is told which transport and tool
+			// extensions it inherited. A claude child is told none of it: the pane
+			// it runs in is the bridge's business, not its own.
+			const env = runner === "pi"
+				? { ...childEnv, PI_SUBAGENT_LAYOUT_DIR: layout.directory,
+					PI_SUBAGENT_MASTER: layout.master, PI_SUBAGENT_BACKEND: "herdr",
+					PI_SUBAGENT_TOOL_EXTENSIONS: JSON.stringify(CUSTOM_TOOL_EXTENSIONS) }
+				: (childEnv ?? process.env);
 			// A pane child has no stdin its parent can write to, so it is typed to —
 			// the same door the user sitting at that pane would use. Same contract as
 			// the RPC sender, different mechanism.
@@ -869,8 +1007,14 @@ async function runSubagent(
 				delivered();
 			});
 			void runInPane(layout, { command, args: spawnArgs, cwd, env, directory: tempDir,
-				name: handle, signal, onLine: processLine, onPane: id => { paneId = id; } }).then(exit => {
-				if (exit.error) progress.error = exit.error;
+				name: handle, signal, onLine: processLine, onPane: id => { paneId = id; },
+				bridge: runner === "claude" ? "claude" : "pi", openingPrompt }).then(exit => {
+				// The pane watcher knows something this process cannot: whether this
+				// process was still there. A run it ended because the heartbeat went
+				// stale was not cancelled by anyone — it was orphaned.
+				if (exit.stop === "parent") stopped({ subagentStop: "parent" });
+				else if (exit.stop === "cancelled") stopped(signal?.reason);
+				else if (exit.error) progress.error = exit.error;
 				resolve(exit.code);
 			}, error => { progress.error = String(error); resolve(1); });
 			return;
@@ -880,42 +1024,59 @@ async function runSubagent(
 		const env = runner === "pi"
 			? { ...childEnv, PI_SUBAGENT_BACKEND: "process", PI_SUBAGENT_TOOL_EXTENSIONS: JSON.stringify(CUSTOM_TOOL_EXTENSIONS) }
 			: childEnv;
-		// stdin is a channel here, not a one-shot argument. The claude runner writes
-		// its task and closes — its variadic `--tools`/`--allowedTools` would
-		// otherwise swallow a trailing positional prompt as one more tool name — and
-		// a pi child over RPC keeps it open for the life of the run, because that is
-		// how an answer reaches it.
-		const wantsStdin = stdin !== undefined || rpcPrompt !== undefined;
-		const proc = spawn(command, spawnArgs, { cwd, stdio: [wantsStdin ? "pipe" : "ignore", "pipe", "pipe"], env });
+		// stdin is a channel, not a one-shot argument: both runners keep it open
+		// for the life of the run, because that is how an answer reaches a parked
+		// child. Only the envelope differs — pi takes RPC commands, Claude Code
+		// takes the same user messages it would take from a terminal.
+		const proc = spawn(command, spawnArgs, { cwd, stdio: [openingPrompt !== undefined ? "pipe" : "ignore", "pipe", "pipe"], env });
 		// A child that exits before reading gives us EPIPE; the close handler
 		// already reports the real failure, so don't let it crash the parent.
 		proc.stdin?.on("error", () => {});
-		if (stdin !== undefined) {
-			proc.stdin?.end(stdin);
-		} else if (rpcPrompt !== undefined) {
-			const send = (cmd: Record<string, unknown>) => {
+		if (openingPrompt !== undefined) {
+			const write = (payload: Record<string, unknown>) => {
 				if (!proc.stdin || proc.stdin.destroyed || proc.exitCode !== null) throw new Error("the child is no longer running");
-				proc.stdin.write(JSON.stringify(cmd) + "\n");
+				proc.stdin.write(JSON.stringify(payload) + "\n");
 			};
 			/**
 			 * Say something to this child.
 			 *
-			 * `steer` lands between the tool calls of a turn already in flight;
-			 * `prompt` starts a fresh turn in a parked session. Pi rejects the wrong
-			 * one of the two rather than papering over it, which is why `busy` is
-			 * tracked at all.
+			 * Over RPC, `steer` lands between the tool calls of a turn already in
+			 * flight and `prompt` starts a fresh turn in a parked session; pi
+			 * rejects the wrong one of the two rather than papering over it, which
+			 * is why `busy` is tracked at all. Claude Code's streaming input has no
+			 * such split — a user message is queued if a turn is running and starts
+			 * one if not — so the same call covers both.
 			 */
+			const say = protocol === "claude-stream"
+				? (message: string) => write({ type: "user", message: { role: "user", content: [{ type: "text", text: message }] } })
+				: (message: string) => write(busy ? { type: "steer", message } : { type: "prompt", message });
+
+			// What the ask tool reads to tell an answered question from an
+			// outstanding one. It runs in its own process with no channel to this
+			// one, so the run directory is the only thing they share.
+			const recordDelivery = () => {
+				if (protocol !== "claude-stream") return;
+				try {
+					fs.appendFileSync(path.join(tempDir, "answers.jsonl"), JSON.stringify({ at: Date.now() }) + "\n", { mode: 0o600 });
+				} catch { /* the refusal check degrades to allowing the ask */ }
+			};
+
 			const deliver: Sender = (message) => {
-				send(busy ? { type: "steer", message } : { type: "prompt", message });
+				recordDelivery();
+				say(message);
 				delivered();
 			};
 			hooks.onSender?.(deliver);
-			send({ type: "prompt", message: rpcPrompt });
+			// A claude child holds the floor until its stdin closes. Nothing else
+			// ends the run: the child cannot shut its own session down the way a pi
+			// child does, so this is the parent's half of the same contract.
+			finish = () => { try { proc.stdin?.end(); } catch { /* already gone */ } };
+			say(openingPrompt);
 		}
 		let closed = false;
 		let killTimer: ReturnType<typeof setTimeout> | undefined;
 		const kill = () => {
-			progress.error = "Subagent cancelled";
+			stopped(signal?.reason);
 			proc.kill("SIGTERM");
 			killTimer = setTimeout(() => { if (!closed) proc.kill("SIGKILL"); }, 3000);
 		};
@@ -1085,9 +1246,12 @@ function renderAgentProgress(
 			? theme.fg("dim", "○")
 			: isWaiting
 				? theme.fg("warning", "?")
-				: r.exitCode === 0
-					? theme.fg("success", "✓")
-					: theme.fg("error", "✗");
+				: prog.stoppedBy
+					// Not a failure mark: nothing went wrong with the child.
+					? theme.fg("dim", "⊘")
+					: r.exitCode === 0
+						? theme.fg("success", "✓")
+						: theme.fg("error", "✗");
 	const stats = `${prog.toolCount} tools · ${formatDuration(prog.durationMs)}`;
 	const modelStr = r.model ? theme.fg("dim", ` (${r.model})`) : "";
 	addLine(`${icon} ${theme.fg("toolTitle", theme.bold(r.agent))}${modelStr} — ${theme.fg("dim", stats)}`);
@@ -1331,7 +1495,7 @@ export function buildPromptSurface(registry: AgentConfig[]): { snippet: string; 
 			"",
 			"This call is asynchronous. It returns as soon as the child is dispatched, handing you a short handle like `scout-1` — NOT the child's answer. When the child finishes, the harness automatically delivers its report to you as a new message that wakes you up and starts a turn. You do not have to do anything to receive it: there is nothing to poll, no status to check, and no way to wait.",
 			"",
-			"So do not stall on a dispatch. Finish whatever else the current turn needs, and end the turn once nothing is left that does not depend on the answer. If the user is waiting on that answer and nothing else is outstanding, say what you dispatched and stop — you will be woken when it lands.",
+			"So do not stall on a dispatch. Finish whatever else the current turn needs, and end the turn once nothing is left that does not depend on the answer. If the user is waiting on that answer and nothing else is outstanding, say what you dispatched and stop — you will be woken when it lands. Rewriting a brief you have already sent is not \"whatever else the turn needs\": it dispatches a second child, it does not improve the first.",
 			"",
 			"The subagent cannot see this conversation. Everything it needs — the goal, the constraints, the file paths you already know, the shape of the answer you want — has to be written into `task`.",
 			"",
@@ -1343,6 +1507,19 @@ export function buildPromptSurface(registry: AgentConfig[]): { snippet: string; 
 			...registry.flatMap((a) => triggers[a.name] ?? []),
 			"Do the work yourself when you already have the path, need exact file bytes in order to edit, or it is a single lookup — a subagent costs a process start and a fresh system prompt.",
 			"Write `task` as a standalone brief: the goal, the constraints, the paths you already know, and the output shape you want back. A subagent left to infer the context will infer it wrong.",
+			// The child cannot see the conversation, so nothing carries the user's
+			// language across but this. Observed: a Chinese request dispatched as
+			// an English brief, answered in English, translated back by hand.
+			"Write `task` in the language the conversation is in, and say which language the report should come back in. The child cannot see the conversation, so a brief you translated is a report you will have to translate back.",
+			// Observed: the user asked for one runner by name, the dispatch was
+			// refused for an unrelated reason, and the retry dropped the argument.
+			"When the user names a runner, pass it as `runner`. If that dispatch is then refused, say so and let them choose — never re-send with `runner` dropped, which quietly runs their work somewhere they did not ask for.",
+			// Observed: two children given the same question 21 seconds apart,
+			// the second one's brief merely worded better.
+			"A dispatch you have already made is still running. Sending the same brief again does not replace or improve it — you get two children doing one job and two reports. Steer the one you have with `subagent_message` instead.",
+			// The mirror of what every child is told about its caller. The parent
+			// is the one guessing here, and it has somebody to ask too.
+			"Ask the user before dispatching, not after, when the request itself is ambiguous — a term you cannot place, a scope you are guessing at. A child handed a guess comes back confident about the wrong thing, and a whole run is how you find out.",
 			"When a brief leaves a decision that is yours rather than the subagent's — which approach to take, a value you have not settled, anything irreversible — say so in `task`. A child told which decisions are yours asks you about them instead of picking one and building on it.",
 			"Emit several `subagent` calls in one turn for independent investigations; they run concurrently and their reports arrive separately, each waking you as it lands. Plain parallel read/grep/fetch calls already cover simple I/O — don't wrap those in subagents.",
 			"The handle a dispatch returns is an acknowledgement, never an answer. Never summarise, assume or invent what a child found before its report has actually arrived.",
@@ -1368,11 +1545,70 @@ export default function (pi: ExtensionAPI) {
 	let layout: MasterLayout | undefined;
 	let ownedLayoutDir: string | undefined;
 	const shutdown = new AbortController();
+	/** Distinguishes the two aborts that reach a child, which are otherwise one
+	 *  signal by the time `runSubagent` sees them (`AbortSignal.any` below).
+	 *  `AbortSignal.any` forwards the reason of whichever fired. */
+	const SESSION_ENDED = { subagentStop: "session" as StopReason };
 	const running = new Set<Promise<unknown>>();
 	// Dispatched runs, keyed by the handle the widget shows. A record is removed
 	// the instant its result is steered, so `runs` is exactly "what is in flight".
 	const runs = new Map<string, RunRecord>();
 	let runSeq = 0;
+	const projectDir = process.cwd();
+	const retainMs = Math.max(0, config.retainRunsHours ?? 168) * 3600_000;
+
+	/** Note a settled run in the index, so its handle is still addressable from
+	 *  the next session. Rewritten rather than appended: a run can settle twice
+	 *  (picked back up, settles again) and the index holds one row per handle. */
+	const rememberRun = (record: RunRecord) => {
+		if (retainMs === 0) return;
+		const entry: RunIndexEntry = {
+			version: 1, handle: record.id, agent: record.agent, task: record.result.task,
+			tempDir: record.prepared.tempDir, endedAt: Date.now(),
+			stoppedBy: record.result.progress.stoppedBy,
+		};
+		writeRunIndex(projectDir, [...readRunIndex(projectDir).filter((e) => e.handle !== entry.handle), entry]);
+	};
+
+	/**
+	 * Take back the handles of the previous session, and prune what has aged out.
+	 *
+	 * A restored run is a finished one by definition — whatever was in flight
+	 * when the parent went away is not running now. It is restored so that its
+	 * handle still means something: `subagent_message` can pick the same child
+	 * back up from the session the loadout names.
+	 */
+	const restoreRuns = () => {
+		for (const entry of pruneRunIndex(projectDir, retainMs)) {
+			if (runs.has(entry.handle)) continue;
+			const loadout = readLoadout(entry.tempDir);
+			if (!loadout) continue;
+			const progress: AgentProgress = { agent: entry.agent, status: "completed", task: entry.task,
+				recentTools: [], toolCount: 0, tokens: 0, durationMs: 0, lastMessage: "",
+				stoppedBy: entry.stoppedBy, error: entry.stoppedBy ? STOP_MESSAGES[entry.stoppedBy] : undefined };
+			const result: AgentResult = { agent: entry.agent, task: entry.task, output: "", exitCode: 0,
+				model: loadout.model, usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 }, progress };
+			// Rebuilt from the loadout, which is the only description of this run
+			// that survived. `definition` is a stub: the relaunch path reads the
+			// loadout, never today's config, and that is the point of having one.
+			const prepared: PreparedRun = {
+				runner: loadout.runner, args: loadout.args, tempDir: entry.tempDir,
+				childEnv: { ...process.env, ...loadout.env },
+				sessionPath: loadout.sessionPath, sessionId: loadout.sessionId,
+				protocol: loadout.runner === "claude" ? "claude-stream" : (loadout.pane ? undefined : "pi-rpc"),
+			};
+			runs.set(entry.handle, {
+				id: entry.handle, agent: entry.agent, startedAt: entry.endedAt, result, prepared,
+				definition: { name: entry.agent, description: "", tools: [], model: loadout.model,
+					thinking: "medium", systemPrompt: "", filePath: "", runner: loadout.runner },
+				cwd: loadout.cwd, restored: true,
+			});
+			// Handles are unique within a session and must stay unique across one:
+			// a restored `scout-3` and a fresh `scout-3` are different children.
+			const suffix = Number(entry.handle.slice(entry.handle.lastIndexOf("-") + 1));
+			if (Number.isFinite(suffix)) runSeq = Math.max(runSeq, suffix);
+		}
+	};
 	// Captured on session_start so the completion path — which has no ctx of its
 	// own — can repaint the widget. Stays undefined outside interactive mode (and
 	// under unit tests), which makes every widget call a silent no-op there.
@@ -1435,6 +1671,7 @@ export default function (pi: ExtensionAPI) {
 			// `subagent_message` can start the child up again from its session file.
 			// Only the roster forgets it, because it is no longer in flight.
 			updateWidget();
+			rememberRun(record);
 			steerResult(record);
 		})();
 		running.add(settled);
@@ -1454,11 +1691,18 @@ export default function (pi: ExtensionAPI) {
 	 */
 	const steerResult = (record: RunRecord) => {
 		const r = record.result;
-		const failed = r.exitCode !== 0 || !!r.progress.error;
+		const stop = r.progress.stoppedBy;
+		const failed = !stop && (r.exitCode !== 0 || !!r.progress.error);
 		const elapsed = formatDuration(r.progress.durationMs);
-		const content = failed
-			? `Subagent ${record.id} (${record.agent}) failed after ${elapsed}: ${r.progress.error || r.output || `exited ${r.exitCode}`}`
-			: `Subagent ${record.id} (${record.agent}) finished in ${elapsed}.\n\n${r.output || "(no output)"}`;
+		// A stop is reported as what it is, and with what to do about it, because
+		// "failed" is what makes a model try the same dispatch again — exactly the
+		// wrong move when the reason is that somebody stopped it on purpose.
+		const content = stop
+			? `Subagent ${record.id} (${record.agent}) was stopped after ${elapsed}. ${STOP_MESSAGES[stop]}.`
+				+ (stop === "user" ? " Do not dispatch it again unless they ask; say what it had got through, and wait." : "")
+			: failed
+				? `Subagent ${record.id} (${record.agent}) failed after ${elapsed}: ${r.progress.error || r.output || `exited ${r.exitCode}`}`
+				: `Subagent ${record.id} (${record.agent}) finished in ${elapsed}.\n\n${r.output || "(no output)"}`;
 		pi.sendMessage<Details>(
 			{ customType: "subagent_result", content, display: true, details: { results: [r], handle: record.id } },
 			{ triggerTurn: true, deliverAs: "steer" },
@@ -1516,16 +1760,24 @@ export default function (pi: ExtensionAPI) {
 	pi.registerMessageRenderer<Details>("subagent_question", renderSteeredRun);
 
 	Object.assign(CUSTOM_TOOL_EXTENSIONS, JSON.parse(process.env.PI_SUBAGENT_TOOL_EXTENSIONS || "{}"), config.toolExtensions);
-	pi.on("session_start", (_event, ctx) => { uiCtx = ctx; updateWidget(); });
+	pi.on("session_start", (_event, ctx) => { uiCtx = ctx; restoreRuns(); updateWidget(); });
 	pi.on("session_shutdown", async () => {
-		shutdown.abort();
+		shutdown.abort(SESSION_ENDED);
 		await Promise.allSettled([...running]);
 		stopTicker();
-		// Every run directory outlives its child, because a finished subagent can
-		// still be picked back up from the session file inside it. They are all
-		// reclaimed here: once this session is over, nothing can address them.
+		// A run directory outlives its child, because a finished subagent can
+		// still be picked back up from the session inside it — and now it
+		// outlives this session too, for `retainRunsHours`. What is recorded
+		// here is which directories those are; the next session prunes whatever
+		// has aged out. With retention off, they go the way they always did.
 		for (const record of runs.values()) {
-			fs.rmSync(record.prepared.tempDir, { recursive: true, force: true });
+			if (retainMs === 0) { fs.rmSync(record.prepared.tempDir, { recursive: true, force: true }); continue; }
+			// A run adopted at startup and never touched keeps the timestamp it
+			// already had. Re-recording it here would push its age back to zero
+			// every time a session opens and closes, and a retention window that
+			// resets whenever you start the editor is not a retention window.
+			if (record.restored) continue;
+			rememberRun(record);
 		}
 		if (ownedLayoutDir) fs.rmSync(ownedLayoutDir, { recursive: true, force: true });
 	});
@@ -1563,7 +1815,7 @@ export default function (pi: ExtensionAPI) {
 			agent: Type.String({ description: `Which agent to dispatch: ${agents.map((a) => a.name).join(", ") || "(none registered)"}` }),
 			task: Type.String({ description: "Self-contained brief for the subagent. It shares none of this conversation, so restate the goal, the constraints, any paths you already know, and the output shape you want back." }),
 			cwd: Type.Optional(Type.String({ description: "Working directory for the agent process" })),
-			runner: Type.Optional(Type.String({ description: `Which child process runs the agent: ${RUNNERS.join(" or ")}. Omit unless the user explicitly asked for one — the configured default (normally pi) is right otherwise.` })),
+			runner: Type.Optional(Type.String({ description: `Which child process runs the agent: ${RUNNERS.join(" or ")}. Pass it whenever the user names one, in whatever words and whatever language they used — naming it in passing is still naming it. Omit it only when they did not, and the configured default applies.` })),
 		}),
 
 		// `onUpdate` is unused: streaming partial results into a tool call only
@@ -1600,13 +1852,15 @@ export default function (pi: ExtensionAPI) {
 			// A pinned path is loaded explicitly, so it is no longer discovery's job.
 			for (const tool of Object.keys(config.toolExtensions ?? {})) DISCOVERED_TOOL_EXTENSIONS.delete(tool);
 			Object.assign(CUSTOM_TOOL_EXTENSIONS, config.toolExtensions);
-			// Only pi children can report back from a pane: the sidecar that bridges
-			// their events (`herdr/child.ts`) is itself a pi extension. `auto` picks
-			// the process backend for anything else; an explicit `herdr` says so.
-			if (agent.runner !== "pi" && backend === "herdr") {
+			// Both runners can report back from a pane, by different bridges: a pi
+			// child writes the journal itself through `herdr/child.ts`, and a claude
+			// child is wrapped in `herdr/claude-pane.mjs`, which writes it for one.
+			// Anything else has no way home from a pane.
+			const paneCapable = agent.runner === "pi" || agent.runner === "claude";
+			if (!paneCapable && backend === "herdr") {
 				throw new Error(`Agent ${agent.name} runs under the ${agent.runner} runner, which supports the process backend only. Select /subagents-herdr process or auto.`);
 			}
-			const useHerdr = agent.runner === "pi" && (backend === "herdr" || (backend === "auto" && process.env.HERDR_ENV === "1"));
+			const useHerdr = paneCapable && (backend === "herdr" || (backend === "auto" && process.env.HERDR_ENV === "1"));
 			if (useHerdr && !layout) {
 				if (process.env.HERDR_ENV !== "1" || !process.env.HERDR_PANE_ID) throw new Error("Run Pi inside Herdr or select /subagents-herdr process");
 				const directory = process.env.PI_SUBAGENT_LAYOUT_DIR ?? (ownedLayoutDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-master-")));
@@ -1740,8 +1994,13 @@ export default function (pi: ExtensionAPI) {
 			const handle = params.handle?.trim();
 			const record = handle ? runs.get(handle) : undefined;
 			if (!record) {
-				const known = [...runs.values()].map((r) => `${r.id} (${r.result.progress.status})`);
-				throw new Error(`Unknown subagent handle: ${params.handle}. ${known.length ? `Dispatched this session: ${known.join(", ")}.` : "Nothing has been dispatched this session."}`);
+				// Said separately because they are different things to the model: one
+				// it dispatched and can still be holding a thread with, one it
+				// inherited from a session it cannot see and can only pick back up.
+				const known = [...runs.values()].filter((r) => !r.restored).map((r) => `${r.id} (${r.result.progress.status})`);
+				const inherited = [...runs.values()].filter((r) => r.restored).map((r) => r.id);
+				throw new Error(`Unknown subagent handle: ${params.handle}. ${known.length ? `Dispatched this session: ${known.join(", ")}.` : "Nothing has been dispatched this session."}`
+					+ (inherited.length ? ` Still addressable from an earlier session: ${inherited.join(", ")}.` : ""));
 			}
 			const message = params.message?.trim();
 			if (!message) throw new Error(`subagent_message needs something to say to ${record.id}.`);
@@ -1770,8 +2029,21 @@ export default function (pi: ExtensionAPI) {
 			// the second process is the same sandbox as the first.
 			const { tempDir } = record.prepared;
 			const loadout = readLoadout(tempDir);
-			if (!loadout?.sessionPath || !fs.existsSync(loadout.sessionPath)) {
+			// A pi session is a file in the run directory, which the end of the
+			// parent's session reclaims; a claude session is an id in the user's
+			// own store, which outlives us. Both are checked the only way they can
+			// be — the file for its existence, the id for having been recorded.
+			const resumable = loadout?.runner === "claude"
+				? Boolean(loadout.sessionId)
+				: Boolean(loadout?.sessionPath && fs.existsSync(loadout.sessionPath));
+			if (!loadout || !resumable) {
 				throw new Error(`Subagent ${record.id} has finished and its session is gone, so it cannot be picked up again. Dispatch a fresh run with what you have learned.`);
+			}
+			// An interactive pi invocation is what a pane loadout holds, and it has
+			// no stdin channel to put a prompt on. Its pane went with the session
+			// that opened it, so there is nothing to type into either.
+			if (loadout.pane && loadout.runner === "pi" && !record.layout) {
+				throw new Error(`Subagent ${record.id} ran in a pane belonging to a session that has ended, so it cannot be picked back up from here. Dispatch a fresh run with what you have learned.`);
 			}
 			const effectiveSignal = signal ? AbortSignal.any([signal, shutdown.signal]) : shutdown.signal;
 			effectiveSignal.throwIfAborted();
@@ -1780,8 +2052,11 @@ export default function (pi: ExtensionAPI) {
 			// second process is the first one's sandbox, not today's config.
 			const body = `Your caller has more for you: ${message}\n\nYou are picking up the session you already did work in. Carry on from there rather than starting over.`;
 			let args = loadout.args;
-			let rpcPrompt: string | undefined;
-			if (loadout.pane) {
+			let openingPrompt: string | undefined;
+			// A bridged pane child is driven over the same channel in a pane as it
+			// is without one, so it takes its prompt the same way too. Only an
+			// interactive pi child reads it out of argv.
+			if (loadout.pane && loadout.runner !== "claude") {
 				// A pane child takes its prompt in argv, where a long one has to go
 				// through a file, exactly as the original task did.
 				let prompt = body;
@@ -1794,10 +2069,17 @@ export default function (pi: ExtensionAPI) {
 				}
 				args = [...loadout.args.slice(0, -1), prompt];
 			} else {
-				rpcPrompt = body;
+				openingPrompt = body;
+				// `--session-id` asks for a new conversation under that id, which the
+				// first launch already created. The second one joins it instead.
+				if (loadout.runner === "claude" && loadout.sessionId) {
+					args = loadout.args.map((arg) => (arg === "--session-id" ? "--resume" : arg));
+				}
 			}
-			record.prepared = { ...record.prepared, args, rpcPrompt, sessionPath: loadout.sessionPath,
+			record.prepared = { ...record.prepared, args, openingPrompt,
+				sessionPath: loadout.sessionPath, sessionId: loadout.sessionId,
 				childEnv: { ...process.env, ...loadout.env } };
+			record.restored = false; // touched: it is this session's run now
 			record.result.question = undefined;
 			record.result.exitCode = -1;
 			record.result.progress.status = "pending";

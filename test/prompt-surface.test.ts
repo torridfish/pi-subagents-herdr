@@ -55,6 +55,24 @@ test("guidelines lead with when to delegate, not with when not to", () => {
   assert.ok(guidelines.some((g) => /run concurrently/.test(g)));
 });
 
+// Each of these was a real dispatch that went wrong, in a real session. The
+// surface is the only place the parent is told any of it, so the bullets are
+// pinned by what they are for rather than by their wording.
+test("the surface answers the four ways a dispatch has actually gone wrong", () => {
+  const { description, guidelines } = buildPromptSurface([SCOUT]);
+  const text = [description, ...guidelines].join("\n");
+  // The user asked for one runner by name and the retry dropped it.
+  assert.ok(guidelines.some((g) => /names a runner/.test(g)), "nothing tells the parent to pass `runner`");
+  assert.ok(guidelines.some((g) => /never re-send with `runner` dropped/.test(g)));
+  // A Chinese request went out as an English brief and came back in English.
+  assert.ok(guidelines.some((g) => /language the conversation is in/.test(g)));
+  // Two children were given the same question 21 seconds apart.
+  assert.ok(guidelines.some((g) => /already made is still running/.test(g)));
+  assert.match(text, /does not improve the first/);
+  // The parent invented a context for a term it could not place.
+  assert.ok(guidelines.some((g) => /Ask the user before dispatching/.test(g)));
+});
+
 test("an empty registry degrades instead of promising agents that do not exist", () => {
   const { snippet, description, guidelines } = buildPromptSurface([]);
   assert.ok(description.includes("(none registered)"));

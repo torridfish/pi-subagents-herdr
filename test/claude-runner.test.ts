@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import type { AgentConfig, AgentProgress, AgentResult } from "../index.ts";
-import { buildClaudeArgs, makeClaudeLineHandler, resolveClaudeModel } from "../runners/claude.ts";
+import { buildClaudeArgs, CLAUDE_ASK_TOOL, CLAUDE_DEFAULT_MODEL, makeClaudeLineHandler, resolveClaudeModel } from "../runners/claude.ts";
 import { DEFAULT_INHERIT } from "../index.ts";
 
 const AGENT: AgentConfig = {
@@ -29,8 +29,9 @@ test("declared tools map onto real Claude Code tool names, deduped", async () =>
   const { args } = await build();
   // `find` and `ls` both land on Glob — Claude Code has no LS tool.
   assert.deepEqual(valuesAfter(args, "--tools"), ["Read", "Grep", "Glob"]);
-  // --tools decides what exists; --allowedTools stops a headless child prompting.
-  assert.deepEqual(valuesAfter(args, "--allowedTools"), ["Read", "Grep", "Glob"]);
+  // --tools decides what exists; --allowedTools stops a headless child
+  // prompting, and carries the ask tool, which --tools does not govern.
+  assert.deepEqual(valuesAfter(args, "--allowedTools"), ["Read", "Grep", "Glob", CLAUDE_ASK_TOOL]);
   assert.deepEqual(valuesAfter(args, "--permission-prompts"), ["none"]);
 });
 
@@ -38,21 +39,58 @@ test("tools with no honest equivalent are refused before spawning", async () => 
   // Claude Code silently DROPS unknown --tools names, so an unmapped tool would
   // otherwise produce an agent quietly missing a capability it declared.
   await assert.rejects(build({ tools: ["safe_bash"] }), /no filtered shell/);
+  // Observed in the wild: the model read the advice in that message as "retry
+  // differently", dropped `runner`, and quietly ran the agent on pi instead.
+  await assert.rejects(build({ tools: ["safe_bash"] }), /Do not re-dispatch this without `runner`/);
   await assert.rejects(build({ tools: ["subagent"] }), /Task tool spawns its own agent types/);
   await assert.rejects(build({ tools: ["video_extract"] }), /no Claude Code equivalent/);
   assert.deepEqual(valuesAfter((await build({ tools: [] })).args, "--tools"), [""]);
 });
 
-test("the task goes in on stdin, never as a positional argument", async () => {
-  const { args, stdin } = await build();
+test("the task goes in over the stdin channel, never as a positional argument", async () => {
+  const { args, openingPrompt, protocol } = await build();
   // --tools/--allowedTools are variadic: a trailing prompt would be parsed as
   // one more tool name and the run dies with "Input must be provided...".
-  assert.equal(stdin, "Task: do the thing");
+  assert.equal(openingPrompt, "Task: do the thing");
+  assert.equal(protocol, "claude-stream");
   assert.ok(!args.some((a) => a.includes("do the thing")));
-  assert.deepEqual(args.slice(0, 6), ["claude", "-p", "--output-format", "stream-json", "--verbose", "--no-session-persistence"]);
-  assert.deepEqual(valuesAfter(args, "--append-system-prompt"), ["be brief"]);
+  assert.deepEqual(args.slice(0, 7), ["claude", "-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose"]);
   assert.deepEqual(valuesAfter(args, "--model"), ["claude-sonnet-5"]);
   assert.deepEqual(valuesAfter(args, "--effort"), ["medium"]);
+});
+
+// Streaming input is what lets a claude child park on a question instead of
+// exiting, and a persisted session is what lets a finished one be picked back
+// up. `--no-session-persistence` would forfeit the second.
+test("the child is launched on a resumable session it can be relaunched into", async () => {
+  const { args, sessionId } = await build();
+  assert.ok(!args.includes("--no-session-persistence"));
+  assert.match(String(sessionId), /^[0-9a-f-]{36}$/);
+  assert.deepEqual(valuesAfter(args, "--session-id"), [sessionId]);
+});
+
+// The delegation note is the stronger of the two instructions for a smaller
+// model, so it goes to every agent — with or without a prompt of its own.
+test("every agent is told it has a caller, by the name its runner gives the tool", async () => {
+  const withPrompt = valuesAfter((await build()).args, "--append-system-prompt");
+  assert.equal(withPrompt.length, 1);
+  assert.match(withPrompt[0], /^be brief\n\n## Your caller/);
+  assert.ok(withPrompt[0].includes(CLAUDE_ASK_TOOL));
+
+  const bare = valuesAfter((await build({ systemPrompt: "" })).args, "--append-system-prompt");
+  assert.match(bare[0], /^## Your caller/);
+});
+
+// MCP is the only surface a headless claude child loads a tool from, and
+// `--tools` does not govern MCP tools — so the ask tool is allowed by name or
+// it is denied outright under `--permission-prompts none`.
+test("the ask tool is carried in over MCP and pre-approved", async () => {
+  const { args, tempDir } = await build();
+  const config = JSON.parse(valuesAfter(args, "--mcp-config")[0]);
+  const server = config.mcpServers.pi_subagents;
+  assert.ok(server.args[0].endsWith("claude-ask.mjs"));
+  assert.equal(server.env.PI_SUBAGENT_RUN_DIR, tempDir);
+  assert.ok(valuesAfter(args, "--allowedTools").includes(CLAUDE_ASK_TOOL));
 });
 
 test("inheritance flags and runner settings are honoured", async () => {
@@ -70,9 +108,21 @@ test("inheritance flags and runner settings are honoured", async () => {
 test("only Anthropic models survive the pi provider/id spelling", () => {
   assert.equal(resolveClaudeModel("anthropic/claude-opus-5[1m]"), "claude-opus-5[1m]");
   assert.equal(resolveClaudeModel("sonnet"), "sonnet");
-  // A non-Anthropic parent model means nothing here; let Claude Code default.
+  // A non-Anthropic parent model means nothing here.
   assert.equal(resolveClaudeModel("openai/gpt-5"), undefined);
   assert.equal(resolveClaudeModel(""), undefined);
+});
+
+// Omitting --model is not the neutral choice it looks like: Claude Code then
+// runs its own default, the top of the range, so a child dispatched from a
+// session on any non-Anthropic model would quietly be the priciest one going.
+test("a child whose model does not survive is named one anyway", async () => {
+  const fallback = async (overrides = {}, config = {}) =>
+    valuesAfter((await build({ model: "openai/gpt-5", ...overrides }, DEFAULT_INHERIT, config)).args, "--model");
+  assert.deepEqual(await fallback(), [CLAUDE_DEFAULT_MODEL]);
+  assert.deepEqual(await fallback({}, { model: "sonnet" }), ["sonnet"], "the configured fallback was ignored");
+  assert.deepEqual(await fallback({ model: "anthropic/claude-haiku-4-5" }, { model: "sonnet" }), ["claude-haiku-4-5"],
+    "the agent's own model lost to the fallback");
 });
 
 // ── Event adapter ─────────────────────────────────────────────────────
@@ -141,7 +191,7 @@ test("denials on an otherwise successful run are still reported", () => {
 
 // ── Backend guard ─────────────────────────────────────────────────────
 
-test("the herdr backend refuses a claude-run agent instead of opening a dead pane", async () => {
+test("the herdr backend takes a claude-run agent like any other", async () => {
   const { default: extension, registerAgent } = await import("../index.ts");
   const tools = new Map<string, any>(), commands = new Map<string, any>(), handlers = new Map<string, any>();
   extension({ registerTool: (t: any) => tools.set(t.name, t), registerCommand: (n: string, c: any) => commands.set(n, c),
@@ -149,12 +199,22 @@ test("the herdr backend refuses a claude-run agent instead of opening a dead pan
     registerMessageRenderer() {}, sendMessage() {} } as any);
   const ctx = { cwd: process.cwd(), model: { provider: "anthropic", id: "claude-sonnet-5" },
     modelRegistry: { find: () => undefined }, ui: { notify() {} } };
+  // Unset for the length of the test whether or not the suite is being run
+  // from inside Herdr: the assertion below is about which error comes back,
+  // and with a real Herdr around it the call would open a real pane.
+  const herdrEnv = process.env.HERDR_ENV;
+  delete process.env.HERDR_ENV;
   try {
     registerAgent({ ...AGENT, name: "claude-probe", tools: ["read"] });
     const call = () => tools.get("subagent").execute("test", { agent: "claude-probe", task: "t" }, undefined, undefined, ctx);
     await commands.get("subagents-herdr").handler("herdr", ctx);
-    // A pane child reports back through a pi extension, so a claude child in one
-    // would have no result channel at all.
-    await assert.rejects(call(), /claude runner, which supports the process backend only/);
-  } finally { await handlers.get("session_shutdown")(); }
+    // It used to be refused here: a pane child reported back through a pi
+    // extension, which a claude child cannot load. `herdr/claude-pane.mjs`
+    // writes that journal for one instead, so the only thing left in the way
+    // is the ordinary one — this session is not running inside Herdr.
+    await assert.rejects(call(), /Run Pi inside Herdr or select \/subagents-herdr process/);
+  } finally {
+    if (herdrEnv === undefined) delete process.env.HERDR_ENV; else process.env.HERDR_ENV = herdrEnv;
+    await handlers.get("session_shutdown")();
+  }
 });
