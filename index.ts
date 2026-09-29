@@ -1089,6 +1089,7 @@ async function runSubagent(
 
 		proc.stderr?.on("data", (d: Buffer) => {
 			stderrBuf += d.toString();
+			if (process.env.PI_SUBAGENT_STDERR_DEBUG) fs.appendFileSync("/tmp/subagent-child-stderr.log", d.toString());
 		});
 
 		proc.on("close", (code) => {
