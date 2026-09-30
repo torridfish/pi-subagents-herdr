@@ -5,7 +5,6 @@
   "minPaneRows": 8,
   "models": {},
   "runners": {},
-  "claude": {},
   "toolExtensions": {},
   "inherit": { "extensions": true, "skills": false }
 }
