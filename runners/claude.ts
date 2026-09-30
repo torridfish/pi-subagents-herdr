@@ -205,8 +205,12 @@ export async function buildClaudeArgs(
 	// Two separate jobs. `--tools` decides which tools EXIST in the child — the
 	// real analogue of pi's `--tools` allowlist. `--allowedTools` pre-approves
 	// them so a headless child never stops on a permission prompt. Pairing them
-	// with `--permission-prompts none` means anything outside the declared set is
-	// denied outright rather than hanging forever waiting for a human.
+	// with `--permission-prompts none` means anything else that would prompt is
+	// denied outright rather than hanging forever waiting for a human. The one
+	// exception is Claude Code's built-in set of read-only Bash commands (`ls`,
+	// `cat`, `grep`, `find`, read-only `git`, …): it runs without a prompt in
+	// every mode, is not configurable, and `--allowedTools` never gates it — a
+	// deliberate allowance, and a read-only one.
 	args.push("--permission-prompts", "none");
 	if (config.permissionMode) args.push("--permission-mode", config.permissionMode);
 	if (tools.length > 0) {
