@@ -24,7 +24,7 @@ Each child's pane is labelled with its handle (`researcher-2`), not its agent ty
 - **Flat topology**: no bundled agent carries the `subagent` tool, so every child is dispatched by the main session. The nesting machinery (`subagent_agents`, `PI_SUBAGENT_ALLOWED`, the cross-process layout lock) is still in place and dormant — granting `subagent` in an agent's frontmatter turns it back on, but a child that dispatches asynchronously and then settles will shut down before its own children finish.
 - Parent cancellation/shutdown cleans up owned children. A runner heartbeat terminates a child after loss of its parent. Manual topology changes fail safely instead of rearranging unrelated panes.
 - Outside Herdr, `auto` uses upstream-style headless JSON subprocesses. A Herdr failure is reported, never silently rerun in a second backend.
-- Pluggable **runners**: an agent runs as a Pi child by default, or as a headless Claude Code child (`runner: claude`). Both feed the same progress display, concurrency limit, cancellation and question loop, and both get their own Herdr pane.
+- Pluggable **runners**: an agent runs as a Pi child by default, or as a headless Claude Code child (`runner: claude`). Both feed the same progress display, concurrency limit, cancellation and question loop, and both get their own Herdr pane. A third shape needs no runner at all: an agent whose model is `claude-code/<id>` is an ordinary Pi child running on the [pi-claude-code-provider](https://github.com/torridfish/pi-claude-code-provider) — Claude Code's harness behind pi's interface.
 
 ## Install
 
@@ -174,6 +174,21 @@ A single call can also override both, which is how a conversational instruction 
 Precedence: explicit `runner` on the call → per-agent config → `default` config → frontmatter → `pi`. An unrecognised name is refused instead of silently falling back. Both runners open a pane under the Herdr backend, by different bridges — see [Watching a claude child](#watching-a-claude-child).
 
 Everything downstream of the child is shared — the in-flight widget, the steered result and its `Ctrl+O` progress block, the concurrency semaphore, cancellation, and output truncation all work the same for both runners.
+
+### Provider-model agents (claude-code/* on the pi runner)
+
+An agent can run on Claude Code without the dedicated runner: give it a `claude-code/<model-id>` model and leave it on the `pi` runner. The child is an ordinary pi process whose model is the [pi-claude-code-provider](https://github.com/torridfish/pi-claude-code-provider), which drives a headless `claude -p` behind pi's interface. Nothing herdr-side changes: the pane, the ask bridge, `subagent_message`, nested dispatch and the renderer all work as they do for any pi child, and the provider arms its tool relay so the agent's declared tools reach claude and are executed by pi — rendered as real tool rows.
+
+```json
+{ "models": { "scout": "claude-code/sonnet" } }
+```
+
+or `model: claude-code/sonnet` in frontmatter. Model precedence is per-agent config → `default` config → frontmatter → **the parent session's model** — so an agent dispatched without a pin inherits whatever the parent runs, which is exactly right for ordinary agents and a silent surprise for a claude-minded one. Pin provider agents explicitly.
+
+Two things to know:
+
+- The provider is an extension like any other: the child loads it through your installed pi packages (`inherit.extensions`, on by default). With `inherit.extensions: false` the dispatch is refused up front — the child would otherwise die on an unknown model after spawning.
+- The id after `claude-code/` is whatever the installed Claude Code CLI accepts (`sonnet`, `opus`, a full dated id, the `[1m]` spellings); the provider reads the catalog out of your binary at startup. `anthropic/<id>` is accepted on either runner and stripped to the id.
 
 **Tool mapping.** Declared tools are translated to Claude Code's built-in names, and anything unmappable fails before the child is spawned. This check is load-bearing: `--tools` silently *drops* names Claude Code does not recognise, so an unvalidated mapping would produce an agent quietly missing a capability it declared.
 
