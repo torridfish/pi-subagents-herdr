@@ -54,3 +54,27 @@ test("an unknown runner is refused by name, not silently ignored", async () => {
 });
 
 test.after(async () => { await handlers.get("session_shutdown")(); });
+
+// ── Provider-backed agents (stage: the claude-code provider as a model) ──
+//
+// An agent whose model is `claude-code/*` is not a claude-runner dispatch: the
+// child is an ordinary pi process whose model happens to be the provider. The
+// runner stays pi and the model id passes through verbatim — pinning that so a
+// future runner-selection change cannot silently route provider models into
+// the dedicated claude runner (or mangle the id).
+
+test("a claude-code/* model stays with the pi runner and passes through verbatim", async () => {
+	const { prepareSubagent, DEFAULT_INHERIT } = await import("../index.ts");
+	const agent = {
+		name: "provider-scout", description: "", tools: ["read"],
+		model: "claude-code/claude-opus-5", thinking: "low", systemPrompt: "", filePath: "",
+	};
+	const prepared = await prepareSubagent(agent, "t", process.cwd(), DEFAULT_INHERIT, {}, false);
+	assert.equal(prepared.runner, "pi");
+	const modelAt = prepared.args.indexOf("--model");
+	assert.ok(modelAt !== -1, "the child is told its model");
+	assert.equal(prepared.args[modelAt + 1], "claude-code/claude-opus-5");
+	// And the claude runner's argv builder was never touched.
+	assert.equal(prepared.protocol, "pi-rpc");
+	assert.equal(prepared.sessionId, undefined);
+});
