@@ -382,17 +382,49 @@ const CHILD_EXTENSION = path.join(EXT_DIR, "herdr", "child.ts");
 const AGENTS_DIR = path.join(EXT_DIR, "agents");
 const TOOLS_DIR = path.join(EXT_DIR, "tools");
 const CONFIG_PATH = path.join(EXT_DIR, "config.json");
+/** A second, user-level config: a shallow merge over the repo copy, keyed by
+ *  top-level setting. This is where model pinning belongs — the repo copy sits
+ *  beside the code (gitignored), which is the wrong place for "which model is
+ *  my worker" when the answer is the same in every project. Living inside the
+ *  pi config dir (~/.pi/agent) means dotfiles/stow manages it like every other
+ *  user setting there; PI_CODING_AGENT_DIR is honored, as pi itself does. */
+const USER_CONFIG_PATH = path.join(
+	process.env.PI_CODING_AGENT_DIR || path.join(os.homedir(), ".pi", "agent"),
+	"subagents-herdr.json",
+);
 const DEFAULT_MAX_CONCURRENCY = 4;
 
+function parseConfigObject(filePath: string): ExtensionConfig {
+	const parsed = JSON.parse(fs.readFileSync(filePath, "utf-8"));
+	if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("Expected a JSON object");
+	return parsed as ExtensionConfig;
+}
+
+/** Overridable so a test can point the layer at a temp dir instead of the
+ *  developer's own ~/.pi — the same lever RUN_INDEX_DIR hands the tests. */
+export function setUserConfigPathForTest(filePath: string | undefined): void {
+	USER_CONFIG_PATH_OVERRIDE = filePath;
+}
+let USER_CONFIG_PATH_OVERRIDE: string | undefined;
+
+function userConfigPath(): string {
+	return USER_CONFIG_PATH_OVERRIDE ?? USER_CONFIG_PATH;
+}
+
 function loadConfig(): ExtensionConfig {
+	let config: ExtensionConfig = {};
 	try {
-		if (fs.existsSync(CONFIG_PATH)) {
-			const parsed = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf-8"));
-			if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("Expected a JSON object");
-			return parsed as ExtensionConfig;
-		}
+		if (fs.existsSync(CONFIG_PATH)) config = parseConfigObject(CONFIG_PATH);
 	} catch (error) { throw new Error(`Invalid ${CONFIG_PATH}: ${error}`); }
-	return {};
+	// User-level wins per top-level key, so a user `models` block replaces the
+	// repo's wholesale rather than mixing the two. A key the user never wrote
+	// falls through to the repo copy, which is what keeps this a layering, not
+	// a takeover.
+	const userPath = userConfigPath();
+	try {
+		if (fs.existsSync(userPath)) Object.assign(config, parseConfigObject(userPath));
+	} catch (error) { throw new Error(`Invalid ${userPath}: ${error}`); }
+	return config;
 }
 
 // Built-in tools that pi provides natively (no extension needed)

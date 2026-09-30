@@ -121,6 +121,7 @@ Copy `config.json.example` to `config.json` beside `index.ts` (gitignored):
 - `maxConcurrency`: runs per parent process, default 4.
 - `models` / `runners`: agent name → model / runner; `default` is the fallback. `runners` accepts only `pi`; `claude` is refused with the migration message.
 - `toolExtensions`: tool name → absolute extension path, overriding discovery.
+- A second, user-level layer lives at `~/.pi/agent/subagents-herdr.json` (`PI_CODING_AGENT_DIR` honors pi's own override): a shallow merge over this file, top-level key by top-level key. Put the settings that are yours in every project there (which model each agent runs on, for instance) and keep this file for what belongs beside the code; the user-level value wins when both define a key.
 - `retainRunsHours`: how long a finished run stays addressable after its session ends (default `168`; `0` reclaims everything at shutdown).
 - `inherit.extensions` / `inherit.skills`: load your packages / skills in children (default `true` / `false`). Skills cost context in every child and their tools are allowlist-filtered anyway.
 
