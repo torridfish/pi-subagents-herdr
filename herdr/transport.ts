@@ -19,10 +19,9 @@ export interface PaneExit {
 export interface PaneLaunch {
   command: string; args: string[]; cwd: string; env: NodeJS.ProcessEnv;
   directory: string; name: string; signal?: AbortSignal;
-  /** Who writes the journal. `pi` means the child does, through the extension
-   *  it loads; `claude` means `claude-pane.mjs` does, wrapped around a headless
-   *  child that knows nothing about any of this. */
-  bridge: "pi" | "claude";
+  /** Who writes the journal: the child pi itself, through the extension it
+   *  loads. */
+  bridge: "pi";
   /** The task, for a bridged child: it arrives over the channel rather than in
    *  argv, so the pane has to be told what to open with. */
   openingPrompt?: string;
@@ -69,10 +68,6 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 export function shellQuote(value: string): string { return "'" + value.replaceAll("'", "'\\''") + "'"; }
 /**
  * Turn a headless pi invocation into the interactive one a pane wants.
- *
- * Only pi's. A bridged child stays exactly as headless as it was built —
- * `claude-pane.mjs` is driving it over the same stream-json channel the
- * process backend uses, and stripping `-p` would take that channel away.
  */
 export function interactiveArgs(args: string[]): string[] {
   const result: string[] = [];
@@ -90,9 +85,7 @@ export async function runInPane(layout: MasterLayout, spec: PaneLaunch): Promise
   spec.signal?.throwIfAborted();
   // Keep Node's entrypoint before Pi flags.
   const entry = spec.args[0]?.match(/\.(?:mjs|cjs|js)$/) ? spec.args.slice(0, 1) : [];
-  const args = spec.bridge === "claude"
-    ? spec.args
-    : [...entry, ...interactiveArgs(spec.args.slice(entry.length))];
+  const args = [...entry, ...interactiveArgs(spec.args.slice(entry.length))];
   await fs.writeFile(path.join(spec.directory, "launch.json"), JSON.stringify({
     command: spec.command, args, cwd: spec.cwd, env: spec.env,
     bridge: spec.bridge, openingPrompt: spec.openingPrompt,
