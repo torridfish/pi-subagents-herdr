@@ -644,6 +644,15 @@ export async function buildPiArgs(
 	args.push("--session", sessionPath);
 	if (!inherit.skills) args.push("--no-skills");
 
+	// A `claude-code/*` model reaches the child only through the claude-code
+	// provider, which is an extension like any other: without inherited user
+	// packages the child would load no provider by that name, and the run would
+	// die on an unknown model after the spawn. Fail here, where the message
+	// reaches whoever dispatched.
+	if (agent.model.startsWith("claude-code/") && !inherit.extensions) {
+		throw new Error(`Agent ${agent.name} runs on ${agent.model}, which needs the claude-code provider loaded in the child, but inherit.extensions is off — the child loads no user packages. Turn inherit.extensions on, or pick a model the child can resolve on its own.`);
+	}
+
 	// Separate builtin tools from custom tools. Both kinds share the same
 	// --tools allowlist in pi; --no-tools would disable extension tools too.
 	const allowlist: string[] = [];

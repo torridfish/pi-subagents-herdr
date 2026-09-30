@@ -78,3 +78,24 @@ test("a claude-code/* model stays with the pi runner and passes through verbatim
 	assert.equal(prepared.protocol, "pi-rpc");
 	assert.equal(prepared.sessionId, undefined);
 });
+
+// ── Model semantics for provider-backed agents ────────────────────────
+
+test("a claude runner agent with a claude-code/ model runs the id it names", async () => {
+	const { prepareSubagent, DEFAULT_INHERIT } = await import("../index.ts");
+	const agent = { name: "cc-runner", description: "", tools: ["read"],
+		model: "claude-code/opus", thinking: "low", systemPrompt: "", filePath: "", runner: "claude" as const };
+	const prepared = await prepareSubagent(agent, "t", process.cwd(), DEFAULT_INHERIT, {}, false);
+	const modelAt = prepared.args.indexOf("--model");
+	assert.equal(prepared.args[modelAt + 1], "opus", "the provider spelling strips to the id the CLI understands");
+});
+
+test("a claude-code model with inherit.extensions off is refused before spawning", async () => {
+	const { prepareSubagent } = await import("../index.ts");
+	const agent = { name: "no-inherit", description: "", tools: ["read"],
+		model: "claude-code/opus", thinking: "low", systemPrompt: "", filePath: "" };
+	await assert.rejects(
+		prepareSubagent(agent, "t", process.cwd(), { extensions: false, skills: false }, {}, false),
+		/claude-code provider loaded in the child/,
+	);
+});

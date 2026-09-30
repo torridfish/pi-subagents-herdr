@@ -130,7 +130,12 @@ export function resolveClaudeModel(model: string): string | undefined {
 	if (!model) return undefined;
 	const slash = model.indexOf("/");
 	if (slash === -1) return model; // already a Claude Code alias or full id
-	return model.slice(0, slash) === "anthropic" ? model.slice(slash + 1) : undefined;
+	const provider = model.slice(0, slash);
+	// `anthropic/` is the plain-API spelling, `claude-code/` the provider's —
+	// both mean "claude, by id" here, and frontmatter should be portable
+	// across runners.
+	if (provider === "anthropic" || provider === "claude-code") return model.slice(slash + 1);
+	return undefined;
 }
 
 export async function buildClaudeArgs(
