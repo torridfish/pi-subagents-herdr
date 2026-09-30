@@ -258,4 +258,4 @@ Herdr configuration and server versions are never modified. API calls are bounde
 
 ## Provenance
 
-Based directly on upstream history at `1f541897588b995144f0bb8e71a335d1c85b1e62`. Herdr execution UX was informed by [0xRichardH/pi-herdr-subagents](https://github.com/0xRichardH/pi-herdr-subagents), while layout and transport code here are newly implemented. See [PROVENANCE.md](PROVENANCE.md) before redistribution: the base repository supplied no LICENSE, so this repository is private and is not represented as MIT-licensed.
+Based directly on upstream history at `1f541897588b995144f0bb8e71a335d1c85b1e62`. Herdr execution UX was informed by [0xRichardH/pi-herdr-subagents](https://github.com/0xRichardH/pi-herdr-subagents), while layout and transport code here are newly implemented. See [PROVENANCE.md](PROVENANCE.md) for the publication basis: the base repository supplied no LICENSE, and this repository is published as a GitHub fork of it — nothing here is represented as MIT-licensed.

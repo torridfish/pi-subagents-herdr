@@ -6,7 +6,11 @@
 - Base commit: `1f541897588b995144f0bb8e71a335d1c85b1e62`
 - Original Git history is retained; the original README is preserved in `docs/UPSTREAM-README.md`.
 - `index.ts`, `tools/safe-bash.ts`, and bundled agent definitions are derived from this base.
-- No LICENSE file was present in that upstream checkout, and GitHub reported its license as null. Public availability is not a blanket redistribution license. Do not publish this derivative publicly or claim it is MIT-licensed without permission from the base author or a subsequently supplied applicable license.
+- No LICENSE file was present in that upstream checkout, and GitHub reported its license as null.
+
+## Publication
+
+This repository is published as a GitHub fork of the base repository, with the original history and authorship intact (see `git log`). The fork relationship is what makes public availability legitimate here: GitHub's Terms of Service cover use of forked content on GitHub — the same basis every other public fork of the base repository stands on. Nothing in this repository is represented as MIT-licensed, and redistribution outside GitHub still requires the base author's permission.
 
 ## Reference project
 
