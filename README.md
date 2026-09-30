@@ -13,6 +13,10 @@ One child                 Three children
 └──────────────┴─────────┘ └──────────────┴─────────┘
 ```
 
+The real thing — a master on the left and four children stacked beside it, two on Claude Code (`claude-code/sonnet`, `claude-code/haiku`) and two on the parent's model, dispatched in parallel from a single turn. Each pane's status bar names the model actually running; the master's widget lists every in-flight run:
+
+![Four children in the master/stack layout — two on Claude Code, two on the parent's model](docs/layout.png)
+
 Each child's pane is labelled with its handle (`researcher-2`), not its agent type, so a stack of three researchers is three distinguishable panes. The first child splits **right** of the caller. Subsequent children append **down** in the stack; owned stack splits are rebalanced to equal heights. The master never becomes another shrinking stack pane. Child completion closes its pane and rebalances the remainder. The final child closing restores the original caller region.
 
 - Keeps upstream's `subagent({ agent, task, cwd? })`, isolated contexts, and per-process concurrency limit.
