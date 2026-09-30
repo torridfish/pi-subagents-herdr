@@ -15,8 +15,7 @@ import * as path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { getMarkdownTheme, parseFrontmatter, truncateHead, withFileMutationQueue, DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES } from "@earendil-works/pi-coding-agent";
 import { Box, type Component, Container, Markdown, Spacer, Text, visibleWidth } from "@earendil-works/pi-tui";
-import { buildClaudeArgs, makeClaudeLineHandler, type ClaudeRunnerConfig } from "./runners/claude.ts";
-import { delegationNote, extractToolArgsPreview, isRunner, proseSummary, RUNNERS, type RunnerArgs, type RunnerName } from "./runners/shared.ts";
+import { delegationNote, extractToolArgsPreview, isRunner, proseSummary, runnerRefusal, RUNNERS, type RunnerArgs, type RunnerName } from "./runners/shared.ts";
 import { Type } from "typebox";
 
 // ── Types ──────────────────────────────────────────────────────────────
@@ -37,9 +36,11 @@ export interface AgentConfig {
 	 */
 	subagentAgents?: string[];
 	/**
-	 * Which child process executes this agent: `pi` (default) or `claude`.
-	 * Set per agent in frontmatter, overridden by the `runners` config block.
-	 * The claude runner is process-backend only — see `runners/claude.ts`.
+	 * Which child process executes this agent. `pi` is the only runner: an
+	 * agent that should run on Claude Code gets a `claude-code/*` model and
+	 * stays on it — the claude-code provider drives the harness behind pi's
+	 * interface. Set per agent in frontmatter, overridden by the `runners`
+	 * config block.
 	 */
 	runner?: RunnerName;
 }
@@ -201,11 +202,9 @@ interface Loadout {
 	pane: boolean;
 	cwd: string;
 	args: string[];
-	/** Exactly one of these is set, and which one is the runner's business: pi
-	 *  resumes from a session file it was given, claude from an id it was
-	 *  assigned. Either way it is what makes a finished child resumable. */
+	/** The session file pi resumes a finished child from; this is what makes a
+	 *  run addressable after its process is gone. */
 	sessionPath?: string;
-	sessionId?: string;
 	env: Record<string, string>;
 }
 
@@ -216,7 +215,7 @@ function writeLoadout(prepared: PreparedRun, agent: AgentConfig, cwd: string, pa
 	}
 	const loadout: Loadout = {
 		version: 1, agent: agent.name, runner: prepared.runner, model: agent.model,
-		pane, cwd, args: prepared.args, sessionPath: prepared.sessionPath, sessionId: prepared.sessionId, env,
+		pane, cwd, args: prepared.args, sessionPath: prepared.sessionPath, env,
 	};
 	fs.writeFileSync(path.join(prepared.tempDir, "loadout.json"), JSON.stringify(loadout, null, 2), { mode: 0o600 });
 }
@@ -328,8 +327,6 @@ interface ExtensionConfig {
 	/** Agent name → runner, plus an optional `default`. Same precedence shape as
 	 *  `models`: per-agent config → default config → agent frontmatter → `pi`. */
 	runners?: Record<string, string>;
-	/** Settings for the claude runner. Ignored by pi-run agents. */
-	claude?: ClaudeRunnerConfig;
 	/** How long a finished run stays addressable after the session that
 	 *  dispatched it ends, in hours. Default 168 (a week); 0 keeps nothing,
 	 *  which is what this did before handles survived a restart. Its run
@@ -478,7 +475,7 @@ function loadAgents(): AgentConfig[] {
 			.map((t) => t.trim())
 			.filter(Boolean);
 		const rawRunner = (frontmatter as Record<string, string>).runner?.trim();
-		if (rawRunner && !isRunner(rawRunner)) throw new Error(`Agent ${frontmatter.name}: unknown runner ${rawRunner} (expected ${RUNNERS.join(" or ")})`);
+		if (rawRunner && !isRunner(rawRunner)) throw new Error(`Agent ${frontmatter.name}: ${runnerRefusal(rawRunner)}`);
 		const rawSubagentAgents = (frontmatter as Record<string, string>).subagent_agents;
 		const subagentAgents = rawSubagentAgents
 			? rawSubagentAgents.split(",").map((t) => t.trim()).filter(Boolean)
@@ -764,14 +761,10 @@ export async function prepareSubagent(
 	task: string,
 	cwd: string,
 	inherit: Required<InheritConfig>,
-	claudeConfig: ClaudeRunnerConfig,
 	pane = false,
 ): Promise<PreparedRun> {
 	const runner: RunnerName = agent.runner ?? "pi";
-	const built = runner === "claude"
-		? await buildClaudeArgs(agent, task, cwd, inherit, claudeConfig)
-		: await buildPiArgs(agent, task, cwd, inherit, pane);
-	return { ...built, runner };
+	return { ...await buildPiArgs(agent, task, cwd, inherit, pane), runner };
 }
 
 /**
@@ -794,11 +787,8 @@ async function runSubagent(
 	hooks: RunHooks = {},
 	layout?: MasterLayout,
 ): Promise<AgentResult> {
-	const { runner, args, tempDir, childEnv, openingPrompt, protocol } = prepared;
+	const { args, tempDir, childEnv, openingPrompt, protocol } = prepared;
 	const onUpdate = hooks.onUpdate;
-	// Defence in depth: execute() already refuses this combination with a better
-	// message, but only pi and claude have a way to report out of a pane.
-	if (layout && runner !== "pi" && runner !== "claude") throw new Error(`The ${runner} runner supports the process backend only`);
 	const command = args[0];
 	const spawnArgs = args.slice(1);
 
@@ -968,44 +958,14 @@ async function runSubagent(
 			onUpdate?.();
 		};
 
-		/** A turn settled with nothing outstanding: the child has said its piece
-		 *  and the run is over. A pi child reaches this state by shutting itself
-		 *  down; a claude child has to be let go, because its stdin is what keeps
-		 *  it alive. Set once the channel exists. */
-		let finish: (() => void) | undefined;
-
-		const processLine = runner === "claude"
-			? makeClaudeLineHandler({
-				progress, result, fireUpdate, startTime,
-				onQuestion: (asked) => { question = asked; },
-				// Same decision the pi path makes on `agent_settled`, in the same
-				// order: park on an unanswered question, otherwise let the child go.
-				onTurnEnd: () => {
-					busy = false;
-					if (question) {
-						if (progress.status !== "waiting") {
-							progress.status = "waiting";
-							result.question = question;
-							progress.durationMs = Date.now() - startTime;
-							onUpdate?.();
-							hooks.onWaiting?.(question);
-						}
-						return;
-					}
-					finish?.();
-				},
-			})
-			: processPiLine;
+		const processLine = processPiLine;
 
 		if (layout) {
 			// PI_SUBAGENT_* is how a pi child is told which transport and tool
-			// extensions it inherited. A claude child is told none of it: the pane
-			// it runs in is the bridge's business, not its own.
-			const env = runner === "pi"
-				? { ...childEnv, PI_SUBAGENT_LAYOUT_DIR: layout.directory,
-					PI_SUBAGENT_MASTER: layout.master, PI_SUBAGENT_BACKEND: "herdr",
-					PI_SUBAGENT_TOOL_EXTENSIONS: JSON.stringify(CUSTOM_TOOL_EXTENSIONS) }
-				: (childEnv ?? process.env);
+			// extensions it inherited.
+			const env = { ...childEnv, PI_SUBAGENT_LAYOUT_DIR: layout.directory,
+				PI_SUBAGENT_MASTER: layout.master, PI_SUBAGENT_BACKEND: "herdr",
+				PI_SUBAGENT_TOOL_EXTENSIONS: JSON.stringify(CUSTOM_TOOL_EXTENSIONS) };
 			// A pane child has no stdin its parent can write to, so it is typed to —
 			// the same door the user sitting at that pane would use. Same contract as
 			// the RPC sender, different mechanism.
@@ -1017,7 +977,7 @@ async function runSubagent(
 			});
 			void runInPane(layout, { command, args: spawnArgs, cwd, env, directory: tempDir,
 				name: handle, signal, onLine: processLine, onPane: id => { paneId = id; },
-				bridge: runner === "claude" ? "claude" : "pi", openingPrompt }).then(exit => {
+				bridge: "pi", openingPrompt }).then(exit => {
 				// The pane watcher knows something this process cannot: whether this
 				// process was still there. A run it ended because the heartbeat went
 				// stale was not cancelled by anyone — it was orphaned.
@@ -1029,14 +989,11 @@ async function runSubagent(
 			return;
 		}
 		// PI_SUBAGENT_* is how a pi child is told which transport and tool
-		// extensions it inherited; it means nothing to any other runner.
-		const env = runner === "pi"
-			? { ...childEnv, PI_SUBAGENT_BACKEND: "process", PI_SUBAGENT_TOOL_EXTENSIONS: JSON.stringify(CUSTOM_TOOL_EXTENSIONS) }
-			: childEnv;
-		// stdin is a channel, not a one-shot argument: both runners keep it open
-		// for the life of the run, because that is how an answer reaches a parked
-		// child. Only the envelope differs — pi takes RPC commands, Claude Code
-		// takes the same user messages it would take from a terminal.
+		// extensions it inherited.
+		const env = { ...childEnv, PI_SUBAGENT_BACKEND: "process", PI_SUBAGENT_TOOL_EXTENSIONS: JSON.stringify(CUSTOM_TOOL_EXTENSIONS) };
+		// stdin is a channel, not a one-shot argument: it stays open for the
+		// life of the run, because that is how an answer reaches a parked child
+		// — pi takes RPC commands over it.
 		const proc = spawn(command, spawnArgs, { cwd, stdio: [openingPrompt !== undefined ? "pipe" : "ignore", "pipe", "pipe"], env });
 		// A child that exits before reading gives us EPIPE; the close handler
 		// already reports the real failure, so don't let it crash the parent.
@@ -1047,39 +1004,18 @@ async function runSubagent(
 				proc.stdin.write(JSON.stringify(payload) + "\n");
 			};
 			/**
-			 * Say something to this child.
-			 *
-			 * Over RPC, `steer` lands between the tool calls of a turn already in
-			 * flight and `prompt` starts a fresh turn in a parked session; pi
-			 * rejects the wrong one of the two rather than papering over it, which
-			 * is why `busy` is tracked at all. Claude Code's streaming input has no
-			 * such split — a user message is queued if a turn is running and starts
-			 * one if not — so the same call covers both.
+			 * Say something to this child. Over RPC, `steer` lands between the
+			 * tool calls of a turn already in flight and `prompt` starts a fresh
+			 * turn in a parked session; pi rejects the wrong one of the two
+			 * rather than papering over it, which is why `busy` is tracked at all.
 			 */
-			const say = protocol === "claude-stream"
-				? (message: string) => write({ type: "user", message: { role: "user", content: [{ type: "text", text: message }] } })
-				: (message: string) => write(busy ? { type: "steer", message } : { type: "prompt", message });
-
-			// What the ask tool reads to tell an answered question from an
-			// outstanding one. It runs in its own process with no channel to this
-			// one, so the run directory is the only thing they share.
-			const recordDelivery = () => {
-				if (protocol !== "claude-stream") return;
-				try {
-					fs.appendFileSync(path.join(tempDir, "answers.jsonl"), JSON.stringify({ at: Date.now() }) + "\n", { mode: 0o600 });
-				} catch { /* the refusal check degrades to allowing the ask */ }
-			};
+			const say = (message: string) => write(busy ? { type: "steer", message } : { type: "prompt", message });
 
 			const deliver: Sender = (message) => {
-				recordDelivery();
 				say(message);
 				delivered();
 			};
 			hooks.onSender?.(deliver);
-			// A claude child holds the floor until its stdin closes. Nothing else
-			// ends the run: the child cannot shut its own session down the way a pi
-			// child does, so this is the parent's half of the same contract.
-			finish = () => { try { proc.stdin?.end(); } catch { /* already gone */ } };
 			say(openingPrompt);
 		}
 		let closed = false;
@@ -1546,7 +1482,7 @@ export default function (pi: ExtensionAPI) {
 	if (config.masterRatio !== undefined && (!Number.isFinite(config.masterRatio) || config.masterRatio < 0.2 || config.masterRatio > 0.8)) throw new Error("masterRatio must be between 0.2 and 0.8");
 	if (config.minPaneRows !== undefined && (!Number.isInteger(config.minPaneRows) || config.minPaneRows < 3)) throw new Error("minPaneRows must be an integer >= 3");
 	for (const [agent, runner] of Object.entries(config.runners ?? {})) {
-		if (!isRunner(runner)) throw new Error(`runners.${agent} must be one of ${RUNNERS.join(", ")}`);
+		if (!isRunner(runner)) throw new Error(`runners.${agent}: ${runnerRefusal(runner)}`);
 	}
 	const inherit = resolveInherit(config);
 	const semaphore = new Semaphore(concurrency);
@@ -1604,8 +1540,8 @@ export default function (pi: ExtensionAPI) {
 			const prepared: PreparedRun = {
 				runner: loadout.runner, args: loadout.args, tempDir: entry.tempDir,
 				childEnv: { ...process.env, ...loadout.env },
-				sessionPath: loadout.sessionPath, sessionId: loadout.sessionId,
-				protocol: loadout.runner === "claude" ? "claude-stream" : (loadout.pane ? undefined : "pi-rpc"),
+				sessionPath: loadout.sessionPath,
+				protocol: loadout.pane ? undefined : "pi-rpc",
 			};
 			runs.set(entry.handle, {
 				id: entry.handle, agent: entry.agent, startedAt: entry.endedAt, result, prepared,
@@ -1835,7 +1771,7 @@ export default function (pi: ExtensionAPI) {
 			const cwd = ctx.cwd;
 
 			if (params.runner !== undefined && !isRunner(params.runner)) {
-				throw new Error(`Unknown runner: ${params.runner}. Available runners: ${RUNNERS.join(", ")}.`);
+				throw new Error(runnerRefusal(params.runner));
 			}
 			if (!params.agent || !params.task) {
 				throw new Error("`subagent` requires both `agent` and `task`. To fan out work, emit multiple `subagent` tool calls in the same turn — they run in parallel.");
@@ -1862,11 +1798,9 @@ export default function (pi: ExtensionAPI) {
 			// A pinned path is loaded explicitly, so it is no longer discovery's job.
 			for (const tool of Object.keys(config.toolExtensions ?? {})) DISCOVERED_TOOL_EXTENSIONS.delete(tool);
 			Object.assign(CUSTOM_TOOL_EXTENSIONS, config.toolExtensions);
-			// Both runners can report back from a pane, by different bridges: a pi
-			// child writes the journal itself through `herdr/child.ts`, and a claude
-			// child is wrapped in `herdr/claude-pane.mjs`, which writes it for one.
-			// Anything else has no way home from a pane.
-			const paneCapable = agent.runner === "pi" || agent.runner === "claude";
+			// A pi child reports back from a pane by writing the journal itself,
+			// through `herdr/child.ts`. Anything else has no way home from one.
+			const paneCapable = agent.runner === "pi";
 			if (!paneCapable && backend === "herdr") {
 				throw new Error(`Agent ${agent.name} runs under the ${agent.runner} runner, which supports the process backend only. Select /subagents-herdr process or auto.`);
 			}
@@ -1888,7 +1822,7 @@ export default function (pi: ExtensionAPI) {
 
 			// Built before the ack so an agent this machine cannot actually launch
 			// fails *this* call, with a message the model can act on immediately.
-			const prepared = await prepareSubagent(agent, params.task, runCwd, inherit, config.claude ?? {}, useHerdr);
+			const prepared = await prepareSubagent(agent, params.task, runCwd, inherit, useHerdr);
 
 			const id = `${agent.name}-${++runSeq}`;
 			const result: AgentResult = {
@@ -2040,19 +1974,15 @@ export default function (pi: ExtensionAPI) {
 			const { tempDir } = record.prepared;
 			const loadout = readLoadout(tempDir);
 			// A pi session is a file in the run directory, which the end of the
-			// parent's session reclaims; a claude session is an id in the user's
-			// own store, which outlives us. Both are checked the only way they can
-			// be — the file for its existence, the id for having been recorded.
-			const resumable = loadout?.runner === "claude"
-				? Boolean(loadout.sessionId)
-				: Boolean(loadout?.sessionPath && fs.existsSync(loadout.sessionPath));
+			// parent's session reclaims. Its existence is the resumability check.
+			const resumable = Boolean(loadout?.sessionPath && fs.existsSync(loadout.sessionPath));
 			if (!loadout || !resumable) {
 				throw new Error(`Subagent ${record.id} has finished and its session is gone, so it cannot be picked up again. Dispatch a fresh run with what you have learned.`);
 			}
 			// An interactive pi invocation is what a pane loadout holds, and it has
 			// no stdin channel to put a prompt on. Its pane went with the session
 			// that opened it, so there is nothing to type into either.
-			if (loadout.pane && loadout.runner === "pi" && !record.layout) {
+			if (loadout.pane && !record.layout) {
 				throw new Error(`Subagent ${record.id} ran in a pane belonging to a session that has ended, so it cannot be picked back up from here. Dispatch a fresh run with what you have learned.`);
 			}
 			const effectiveSignal = signal ? AbortSignal.any([signal, shutdown.signal]) : shutdown.signal;
@@ -2066,7 +1996,7 @@ export default function (pi: ExtensionAPI) {
 			// A bridged pane child is driven over the same channel in a pane as it
 			// is without one, so it takes its prompt the same way too. Only an
 			// interactive pi child reads it out of argv.
-			if (loadout.pane && loadout.runner !== "claude") {
+			if (loadout.pane) {
 				// A pane child takes its prompt in argv, where a long one has to go
 				// through a file, exactly as the original task did.
 				let prompt = body;
@@ -2080,14 +2010,9 @@ export default function (pi: ExtensionAPI) {
 				args = [...loadout.args.slice(0, -1), prompt];
 			} else {
 				openingPrompt = body;
-				// `--session-id` asks for a new conversation under that id, which the
-				// first launch already created. The second one joins it instead.
-				if (loadout.runner === "claude" && loadout.sessionId) {
-					args = loadout.args.map((arg) => (arg === "--session-id" ? "--resume" : arg));
-				}
 			}
 			record.prepared = { ...record.prepared, args, openingPrompt,
-				sessionPath: loadout.sessionPath, sessionId: loadout.sessionId,
+				sessionPath: loadout.sessionPath,
 				childEnv: { ...process.env, ...loadout.env } };
 			record.restored = false; // touched: it is this session's run now
 			record.result.question = undefined;

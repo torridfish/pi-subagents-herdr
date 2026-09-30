@@ -1,20 +1,30 @@
 /**
- * Pieces both runners need.
+ * Pieces the runner needs.
  *
- * A "runner" is the child process that actually executes an agent: `pi` (the
- * default, and the only one the herdr backend can drive) or `claude`. Each one
- * owns two things — how its argv is built, and how its stdout stream maps onto
- * the `AgentProgress`/`AgentResult` shapes the renderer already understands.
- * Everything downstream of that mapping is runner-agnostic.
+ * A "runner" is the child process that actually executes an agent. `pi` is
+ * the only one: an agent that should run on Claude Code gets a `claude-code/*`
+ * model instead, and the claude-code provider drives the harness behind pi's
+ * interface (see the pi-claude-code-provider README). The runner owns how the
+ * argv is built and how the stdout stream maps onto the `AgentProgress`/
+ * `AgentResult` shapes the renderer understands.
  */
 import type { AgentProgress, AgentResult } from "../index.ts";
 
-export type RunnerName = "pi" | "claude";
+export type RunnerName = "pi";
 
-export const RUNNERS: RunnerName[] = ["pi", "claude"];
+export const RUNNERS: RunnerName[] = ["pi"];
 
 export function isRunner(value: string): value is RunnerName {
 	return (RUNNERS as string[]).includes(value);
+}
+
+/** Why a runner name is refused. `claude` was a runner once; its replacement
+ *  is a model, and the message has to say so rather than read as a typo. */
+export function runnerRefusal(value: string): string {
+	if (value === "claude") {
+		return "the claude runner was removed: give the agent a `claude-code/<model-id>` model instead and leave it on the pi runner — the claude-code provider runs the harness behind pi's interface (see README, \"Provider-model agents\")";
+	}
+	return `unknown runner ${value} (expected ${RUNNERS.join(" or ")})`;
 }
 
 /** What a runner's argv builder returns. `args[0]` is the command; the rest are
@@ -23,27 +33,22 @@ export interface RunnerArgs {
 	args: string[];
 	tempDir: string;
 	childEnv: NodeJS.ProcessEnv | undefined;
-	/** Where this child persists its conversation, when its runner resumes from a
-	 *  file. Set by the pi runner; a run whose child has already exited is
-	 *  restarted from this file with the new message as its next prompt. */
+	/** Where this child persists its conversation: a run whose child has
+	 *  already exited is restarted from this file with the new message as its
+	 *  next prompt. */
 	sessionPath?: string;
-	/** The conversation this child persists under, when its runner resumes by id
-	 *  rather than by path. Set by the claude runner, which is handed the id at
-	 *  launch (`--session-id`) and relaunches with `--resume`. */
-	sessionId?: string;
 	/** The opening prompt for a child driven over a stdin channel, sent once the
 	 *  child is up rather than passed as an argument. The pane transport puts the
 	 *  task in argv instead, because an interactive Pi has no stdin to speak to. */
 	openingPrompt?: string;
-	/** How to speak on that channel. Both protocols are line-delimited JSON over
-	 *  stdin and both keep the child alive between turns, which is what a parked
-	 *  child needs; only the envelope differs. */
+	/** How to speak on that channel: pi's command protocol, line-delimited JSON
+	 *  over stdin, kept open for the life of the run — which is what a parked
+	 *  child needs. */
 	protocol?: ChannelProtocol;
 }
 
-/** `pi-rpc` is pi's command channel (`--mode rpc`); `claude-stream` is Claude
- *  Code's streaming input (`--input-format stream-json`). */
-export type ChannelProtocol = "pi-rpc" | "claude-stream";
+/** pi's command channel (`--mode rpc`). */
+export type ChannelProtocol = "pi-rpc";
 
 /** Everything a runner's line handler mutates. The handler is called once per
  *  line of child stdout and returns nothing; progress reaches the UI through
@@ -115,9 +120,8 @@ export function proseSummary(text: string): string {
  * that somebody is still there, and they can answer — because a role prompt
  * written for autonomous work otherwise reads as "you are on your own".
  *
- * The tool is named rather than assumed: the pi runner registers it as
- * `caller_ping`, while a claude child reaches it through an MCP server and sees
- * the mangled name its host gives it.
+ * The tool is named rather than assumed: whichever surface the child reaches
+ * it through, this name is the one its caller answers on.
  */
 export function delegationNote(askTool: string): string {
 	return [

@@ -5,11 +5,11 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import extension, { registerAgent } from "../index.ts";
 
-// Which runner was chosen is observable without spawning anything: an agent
-// declaring a tool neither runner can supply fails during argv construction, and
-// each runner words that refusal differently.
+// The runner choice is observable without spawning anything: an agent
+// declaring a tool the runner cannot supply fails during argv construction.
 const PI_REFUSAL = /requires unavailable tool/;
-const CLAUDE_REFUSAL = /no Claude Code equivalent/;
+// `claude` was a runner once; refusing it is a migration message now.
+const CLAUDE_MIGRATION = /claude runner was removed.*claude-code\/<model-id>/s;
 
 const EXT_DIR = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const localConfig = (() => {
@@ -29,7 +29,6 @@ const ctx = { cwd: process.cwd(), model: { provider: "vllm", id: "some-model" },
 const base = { description: "", tools: ["definitely-not-a-real-tool"], model: "vllm/some-model",
   thinking: "low", systemPrompt: "", filePath: "" };
 registerAgent({ ...base, name: "unpinned" });
-registerAgent({ ...base, name: "pinned-claude", runner: "claude" });
 
 const call = (agent: string, runner?: string) =>
   tools.get("subagent").execute("t", { agent, task: "t", ...(runner ? { runner } : {}) }, undefined, undefined, ctx);
@@ -38,30 +37,25 @@ test("dispatch defaults to the pi runner", { skip: configPins && "config.json pi
   await assert.rejects(call("unpinned"), PI_REFUSAL);
 });
 
-test("frontmatter can pin an agent to the claude runner", { skip: configPins && "config.json pins runners locally" }, async () => {
-  await assert.rejects(call("pinned-claude"), CLAUDE_REFUSAL);
-});
-
-test("an explicit runner on the call outranks everything else", async () => {
+test("runner: claude is refused with the migration message", async () => {
   // This is the lever a conversational instruction pulls: "send that one to
-  // claude" does not require editing config.json and reloading.
-  await assert.rejects(call("unpinned", "claude"), CLAUDE_REFUSAL);
-  await assert.rejects(call("pinned-claude", "pi"), PI_REFUSAL);
+  // claude" used to dispatch the dedicated runner. The refusal has to say
+  // what replaced it, in words that survive being read back to the model.
+  await assert.rejects(call("unpinned", "claude"), CLAUDE_MIGRATION);
 });
 
 test("an unknown runner is refused by name, not silently ignored", async () => {
-  await assert.rejects(call("unpinned", "codex"), /Unknown runner: codex\. Available runners: pi, claude\./);
+  await assert.rejects(call("unpinned", "codex"), /unknown runner codex \(expected pi\)/);
 });
 
 test.after(async () => { await handlers.get("session_shutdown")(); });
 
-// ── Provider-backed agents (stage: the claude-code provider as a model) ──
+// ── Provider-backed agents (the claude-code provider as a model) ──
 //
-// An agent whose model is `claude-code/*` is not a claude-runner dispatch: the
+// An agent whose model is `claude-code/*` is not a runner dispatch at all: the
 // child is an ordinary pi process whose model happens to be the provider. The
 // runner stays pi and the model id passes through verbatim — pinning that so a
-// future runner-selection change cannot silently route provider models into
-// the dedicated claude runner (or mangle the id).
+// runner-selection change cannot mangle the id.
 
 test("a claude-code/* model stays with the pi runner and passes through verbatim", async () => {
 	const { prepareSubagent, DEFAULT_INHERIT } = await import("../index.ts");
@@ -69,33 +63,22 @@ test("a claude-code/* model stays with the pi runner and passes through verbatim
 		name: "provider-scout", description: "", tools: ["read"],
 		model: "claude-code/claude-opus-5", thinking: "low", systemPrompt: "", filePath: "",
 	};
-	const prepared = await prepareSubagent(agent, "t", process.cwd(), DEFAULT_INHERIT, {}, false);
+	const prepared = await prepareSubagent(agent, "t", process.cwd(), DEFAULT_INHERIT, false);
 	assert.equal(prepared.runner, "pi");
 	const modelAt = prepared.args.indexOf("--model");
 	assert.ok(modelAt !== -1, "the child is told its model");
 	assert.equal(prepared.args[modelAt + 1], "claude-code/claude-opus-5");
-	// And the claude runner's argv builder was never touched.
 	assert.equal(prepared.protocol, "pi-rpc");
-	assert.equal(prepared.sessionId, undefined);
 });
 
 // ── Model semantics for provider-backed agents ────────────────────────
-
-test("a claude runner agent with a claude-code/ model runs the id it names", async () => {
-	const { prepareSubagent, DEFAULT_INHERIT } = await import("../index.ts");
-	const agent = { name: "cc-runner", description: "", tools: ["read"],
-		model: "claude-code/opus", thinking: "low", systemPrompt: "", filePath: "", runner: "claude" as const };
-	const prepared = await prepareSubagent(agent, "t", process.cwd(), DEFAULT_INHERIT, {}, false);
-	const modelAt = prepared.args.indexOf("--model");
-	assert.equal(prepared.args[modelAt + 1], "opus", "the provider spelling strips to the id the CLI understands");
-});
 
 test("a claude-code model with inherit.extensions off is refused before spawning", async () => {
 	const { prepareSubagent } = await import("../index.ts");
 	const agent = { name: "no-inherit", description: "", tools: ["read"],
 		model: "claude-code/opus", thinking: "low", systemPrompt: "", filePath: "" };
 	await assert.rejects(
-		prepareSubagent(agent, "t", process.cwd(), { extensions: false, skills: false }, {}, false),
+		prepareSubagent(agent, "t", process.cwd(), { extensions: false, skills: false }, false),
 		/claude-code provider loaded in the child/,
 	);
 });
