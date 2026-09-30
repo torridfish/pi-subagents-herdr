@@ -145,4 +145,4 @@ Unit tests cover ownership boundaries, cross-process serialization, capacity, ar
 
 ## Provenance
 
-Based on upstream history at `1f541897588b995144f0bb8e71a335d1c85b1e62`; layout and transport code are newly implemented, and Herdr execution UX was informed by [0xRichardH/pi-herdr-subagents](https://github.com/0xRichardH/pi-herdr-subagents). This repository is published as a **GitHub fork** of the base repository, history and authorship intact. The base supplies no LICENSE — nothing here is represented as MIT-licensed, and redistribution outside GitHub requires the base author's permission. See [PROVENANCE.md](PROVENANCE.md).
+Based on upstream history at `1f541897588b995144f0bb8e71a335d1c85b1e62`; layout and transport code are newly implemented, and Herdr execution UX was informed by [0xRichardH/pi-herdr-subagents](https://github.com/0xRichardH/pi-herdr-subagents). This repository is published as a **GitHub fork** of the base repository, history and authorship intact. The base supplies no LICENSE — nothing here is represented as MIT-licensed, and redistribution outside GitHub requires the base author's permission.
