@@ -1439,7 +1439,7 @@ function renderRunsWidget(records: RunRecord[], theme: Theme): Component {
  * third-party extension can register its own agents. Either way the model should
  * be told exactly what it can reach, and nothing it can't.
  */
-export function buildPromptSurface(registry: AgentConfig[]): { snippet: string; description: string; guidelines: string[] } {
+export function buildPromptSurface(registry: AgentConfig[], defaults?: { defaultModel?: string }): { snippet: string; description: string; guidelines: string[] } {
 	const names = registry.map((a) => a.name);
 	const roster = registry.length > 0
 		? registry.map((a) => `- ${a.name}: ${a.description}${a.tools.length > 0 ? ` (tools: ${a.tools.join(", ")})` : ""}`).join("\n")
@@ -1463,6 +1463,13 @@ export function buildPromptSurface(registry: AgentConfig[]): { snippet: string; 
 		],
 	};
 
+	// The model story has to match what `execute` actually does, or the model
+	// would be told a fallback that is not the one it resolves through.
+	// `defaults.defaultModel` is the config's own bottom line — what every
+	// unpinned agent actually lands on when the config pins one.
+	const modelNote = defaults?.defaultModel
+		? "Every agent runs on its configured model by default (this setup pins an explicit default: `" + defaults.defaultModel + "`; per-agent pins may override it), and only when the user explicitly pairs a model with a role do you pass `model` — otherwise omit it and the configured default applies."
+		: "Every agent runs on its configured model by default — the caller's own model when nothing is configured — and only when the user explicitly pairs a model with a role do you pass `model`; otherwise omit it.";
 	return {
 		snippet: `Delegate a task to a background child agent with its own context window${names.length > 0 ? ` (${names.join(", ")})` : ""}`,
 		description: [
@@ -1476,6 +1483,8 @@ export function buildPromptSurface(registry: AgentConfig[]): { snippet: string; 
 			"So do not stall on a dispatch. Finish whatever else the current turn needs, and end the turn once nothing is left that does not depend on the answer. If the user is waiting on that answer and nothing else is outstanding, say what you dispatched and stop — you will be woken when it lands. Rewriting a brief you have already sent is not \"whatever else the turn needs\": it dispatches a second child, it does not improve the first.",
 			"",
 			"The subagent cannot see this conversation. Everything it needs — the goal, the constraints, the file paths you already know, the shape of the answer you want — has to be written into `task`.",
+			"",
+			modelNote,
 			"",
 			"A child that gets stuck on something only you can decide can pause and ask, instead of guessing. That arrives as a question naming its handle; answer it with `subagent_message` and the child carries on from exactly where it stopped.",
 		].join("\n"),
@@ -1492,6 +1501,10 @@ export function buildPromptSurface(registry: AgentConfig[]): { snippet: string; 
 			// Observed: the user asked for one runner by name, the dispatch was
 			// refused for an unrelated reason, and the retry dropped the argument.
 			"When the user names a runner, pass it as `runner`. If that dispatch is then refused, say so and let them choose — never re-send with `runner` dropped, which quietly runs their work somewhere they did not ask for.",
+			// Omitting is the safe move here, the opposite of `runner`: a dropped
+			// runner fails loudly, a spurious model silently overrides what was
+			// deliberately configured.
+			"Pass `model` only when the user explicitly asks for a specific model on a specific role — the default fallback stays configured, so an unspecified dispatch runs on the setup's default model, never the caller's own.",
 			// Observed: two children given the same question 21 seconds apart,
 			// the second one's brief merely worded better.
 			"A dispatch you have already made is still running. Sending the same brief again does not replace or improve it — you get two children doing one job and two reports. Steer the one you have with `subagent_message` instead.",
@@ -1781,8 +1794,10 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	// Built after the registry is loaded and allowlist-filtered, so the model is
-	// told about exactly the agents this process can actually dispatch.
-	const prompt = buildPromptSurface(agents);
+	// told about exactly the agents this process can actually dispatch. The
+	// configured default goes with it: "unspecified falls back to the configured
+	// model" is only true to the model if it is told WHICH model that is.
+	const prompt = buildPromptSurface(agents, { defaultModel: config.models?.default });
 	pi.registerTool({
 		name: "subagent",
 		label: "Subagent",
@@ -1794,6 +1809,7 @@ export default function (pi: ExtensionAPI) {
 			task: Type.String({ description: "Self-contained brief for the subagent. It shares none of this conversation, so restate the goal, the constraints, any paths you already know, and the output shape you want back." }),
 			cwd: Type.Optional(Type.String({ description: "Working directory for the agent process" })),
 			runner: Type.Optional(Type.String({ description: `Which child process runs the agent: ${RUNNERS.join(" or ")}. Pass it whenever the user names one, in whatever words and whatever language they used — naming it in passing is still naming it. Omit it only when they did not, and the configured default applies.` })),
+			model: Type.Optional(Type.String({ description: "Which model this run uses, as provider/model-id (for example claude-code/opus). Omit it unless the user explicitly paired a model with a role — every agent already runs on its configured model, which is the caller's own model when nothing is configured." })),
 		}),
 
 		// `onUpdate` is unused: streaming partial results into a tool call only
@@ -1810,8 +1826,20 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			const definition = agents.find((a) => a.name === params.agent);
+			if (definition && params.model !== undefined) {
+				// An unresolvable model must fail here, as its own tool call, rather
+				// than as a background failure minutes in — and it has to name the
+				// offending value, because the model reading this error wrote it.
+				if (!/^[^/]+\/.+$/.test(params.model)) {
+					throw new Error(`model "${params.model}" is not a provider/model-id pair (expected something like "claude-code/opus" or "opencode-go/glm-5.3-flash"). Fix it, or drop the argument to run ${definition.name} on its configured model.`);
+				}
+			}
 			const agent = definition ? { ...definition,
-				model: config.models?.[definition.name] ?? config.models?.default ?? (definition.model || (ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "")),
+				// An explicit per-call model outranks everything else — the user said
+				// this dispatch specifically. After that the config layer (per-agent,
+				// then the default), then what the agent's own file pinned, and finally
+				// the caller's own model: an unpinned agent runs where the caller runs.
+				model: params.model ?? config.models?.[definition.name] ?? config.models?.default ?? (definition.model || (ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "")),
 				runner: (params.runner ?? config.runners?.[definition.name] ?? config.runners?.default ?? definition.runner ?? "pi") as RunnerName,
 			} : undefined;
 			if (!agent) {

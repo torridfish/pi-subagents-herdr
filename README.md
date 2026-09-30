@@ -92,7 +92,7 @@ Four endings, told apart — a model told its child "failed" reaches for a retry
 { "models": { "scout": "claude-code/sonnet" } }
 ```
 
-or `model: claude-code/sonnet` in frontmatter. Model precedence: per-agent config → `default` config → frontmatter → **the parent session's model** — so an unpinned agent inherits the parent's model. Pin provider agents explicitly.
+or `model: claude-code/sonnet` in frontmatter. Model precedence: an explicit `model` argument on the dispatch → per-agent config → `default` config → frontmatter → **the parent session's model** — so an unpinned agent inherits the parent's model. Pin provider agents explicitly.
 
 - The provider is an extension like any other: children load it through your installed pi packages (`inherit.extensions`, on by default). With `inherit.extensions: false` the dispatch is refused up front rather than dying later on an unknown model.
 - The id is whatever the installed Claude Code CLI accepts (`sonnet`, `opus`, dated ids, `[1m]` spellings); `anthropic/<id>` is accepted and stripped to the id. `thinking` maps to `--effort`, `off` floored at `low`.

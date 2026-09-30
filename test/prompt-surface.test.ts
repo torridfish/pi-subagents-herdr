@@ -79,3 +79,24 @@ test("an empty registry degrades instead of promising agents that do not exist",
   assert.ok(!snippet.includes("("), `snippet should not carry an empty list: ${snippet}`);
   assert.ok(guidelines.every((g) => !/\b(scout|researcher|worker)\b/.test(g)));
 });
+
+// The model story has to match what `execute` resolves, or the model would be
+// told a fallback that is not the one it actually lands on when it omits
+// `model`.
+test("the model note names the configured default when the config pins one", () => {
+  const pinned = buildPromptSurface([SCOUT], { defaultModel: "claude-code/claude-opus-5-5" });
+  assert.match(pinned.description, /configured model by default/);
+  assert.match(pinned.description, /claude-code\/claude-opus-5-5/);
+  const unpinned = buildPromptSurface([SCOUT]);
+  assert.match(unpinned.description, /the caller's own model when nothing is configured/);
+  assert.ok(!unpinned.description.includes("claude-code/"), "an invented default leaked into the unpinned surface");
+});
+
+test("the model note and its guideline survive a filtered registry", () => {
+  // The wording must not name an agent that a filtered child cannot reach —
+  // the "run the worker on glm" phrasing leaked `worker` into a scout-only
+  // surface. The rule itself, though, is generic and must still be there.
+  const { description, guidelines } = buildPromptSurface([SCOUT], { defaultModel: "opencode-go/glm-5.3-flash" });
+  assert.match(description, /explicitly pairs a model with a role/);
+  assert.ok(guidelines.some((g) => /Pass `model` only when the user explicitly asks/.test(g)));
+});
